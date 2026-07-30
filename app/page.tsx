@@ -62,6 +62,24 @@ type MarketBar = {
   volatility: number;
   vwap: number;
   volumeRatio: number;
+  atr: number;
+  macd: number;
+  macdSignal: number;
+  adx: number;
+  directionalIndex: number;
+  openingHigh: number;
+  openingLow: number;
+  sessionHighBefore: number;
+  sessionLowBefore: number;
+  priorHigh: number;
+  priorLow: number;
+  priorClose: number;
+  rollingHigh: number;
+  rollingLow: number;
+  bandWidthRatio: number;
+  rangeExpansion: number;
+  closeLocation: number;
+  bodyStrength: number;
 };
 
 type ModelWeights = {
@@ -71,6 +89,11 @@ type ModelWeights = {
   volatility: number;
   vwap: number;
   volume: number;
+  orb: number;
+  pullback: number;
+  squeeze: number;
+  levels: number;
+  pattern: number;
   threshold: number;
 };
 
@@ -109,6 +132,8 @@ type BacktestResult = {
   roundTrips: number;
   tradesPerDay: number;
   averageHoldBars: number;
+  averageWeekReturn: number;
+  positiveWeekRate: number;
 };
 
 type PaperOrder = {
@@ -125,6 +150,9 @@ type PaperAccount = {
   shares: number;
   avgPrice: number;
   positionOpenedAt: number;
+  stopPrice: number;
+  targetPrice: number;
+  entrySetup: string;
   realized: number;
   orders: PaperOrder[];
   equityHistory: Array<{ time: string; value: number }>;
@@ -144,7 +172,7 @@ type TrainingRun = {
 };
 
 type PersistedLabState = {
-  version: 3;
+  version: 4;
   model: ModelWeights;
   trainingEpoch: number;
   trainingRuns: TrainingRun[];
@@ -158,16 +186,21 @@ const DATA_START = "2020-01-02";
 const DATA_END = "2026-07-29";
 const DEFAULT_START = "2024-01-02";
 const DEFAULT_END = "2025-12-31";
-const STATE_VERSION = 3;
+const STATE_VERSION = 4;
 
 const INITIAL_MODEL: ModelWeights = {
-  trend: 0.29,
-  rsi: 0.14,
-  momentum: 0.23,
-  volatility: 0.08,
-  vwap: 0.17,
-  volume: 0.09,
-  threshold: 0.19,
+  trend: 0.16,
+  rsi: 0.06,
+  momentum: 0.12,
+  volatility: 0.05,
+  vwap: 0.09,
+  volume: 0.08,
+  orb: 0.14,
+  pullback: 0.11,
+  squeeze: 0.08,
+  levels: 0.06,
+  pattern: 0.05,
+  threshold: 0.24,
 };
 
 const INITIAL_PAPER: PaperAccount = {
@@ -175,6 +208,9 @@ const INITIAL_PAPER: PaperAccount = {
   shares: 0,
   avgPrice: 0,
   positionOpenedAt: 0,
+  stopPrice: 0,
+  targetPrice: 0,
+  entrySetup: "",
   realized: 0,
   orders: [],
   equityHistory: [],
@@ -216,7 +252,33 @@ function generateMarketData(): MarketBar[] {
   const random = seededRandom(7241994);
   const raw: Omit<
     MarketBar,
-    "ema9" | "ema21" | "rsi" | "upperBand" | "lowerBand" | "momentum" | "volatility" | "vwap" | "volumeRatio"
+    | "ema9"
+    | "ema21"
+    | "rsi"
+    | "upperBand"
+    | "lowerBand"
+    | "momentum"
+    | "volatility"
+    | "vwap"
+    | "volumeRatio"
+    | "atr"
+    | "macd"
+    | "macdSignal"
+    | "adx"
+    | "directionalIndex"
+    | "openingHigh"
+    | "openingLow"
+    | "sessionHighBefore"
+    | "sessionLowBefore"
+    | "priorHigh"
+    | "priorLow"
+    | "priorClose"
+    | "rollingHigh"
+    | "rollingLow"
+    | "bandWidthRatio"
+    | "rangeExpansion"
+    | "closeLocation"
+    | "bodyStrength"
   >[] = [];
   const cursor = new Date(`${DATA_START}T12:00:00Z`);
   const lastDate = new Date(`${DATA_END}T12:00:00Z`);
@@ -234,6 +296,14 @@ function generateMarketData(): MarketBar[] {
       if (session % 233 === 0 && session > 0) sessionReturn -= 0.045;
       if (session % 311 === 0 && session > 0) sessionReturn += 0.038;
 
+      const regimeRoll = random();
+      const regime = regimeRoll < 0.42 ? "trend" : regimeRoll < 0.68 ? "reversal" : regimeRoll < 0.84 ? "squeeze" : "range";
+      const direction = sessionReturn === 0 ? (random() > 0.5 ? 1 : -1) : Math.sign(sessionReturn);
+      if (regime === "trend") sessionReturn += direction * (0.004 + random() * 0.006);
+      if (regime === "reversal") sessionReturn += direction * (0.002 + random() * 0.004);
+      if (regime === "squeeze") sessionReturn += direction * (0.005 + random() * 0.007);
+      if (regime === "range") sessionReturn *= 0.28;
+
       const gap = (random() - 0.5) * 0.008;
       const sessionOpen = previousClose * (1 + gap);
       let intradayPrice = sessionOpen;
@@ -245,19 +315,49 @@ function generateMarketData(): MarketBar[] {
         const time = `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
         const open = intradayPrice;
         const progress = barInSession / 12;
-        const openingPulse = barInSession < 2 ? (random() - 0.5) * 0.0042 : 0;
+        const openingPulse = barInSession < 2
+          ? direction * (0.00065 + random() * 0.0011) + (random() - 0.5) * 0.0028
+          : 0;
         const closingPulse = barInSession > 10 ? (random() - 0.5) * 0.0032 : 0;
-        const microWave = Math.sin(session * 0.7 + barInSession * 1.35) * 0.00105;
-        const microNoise = (random() - 0.5) * (0.0052 - Math.min(progress, 1 - progress) * 0.0018);
-        const meanReversion = ((sessionOpen - open) / sessionOpen) * 0.045;
-        const barReturn = sessionReturn / 13 + openingPulse + closingPulse + microWave + microNoise + meanReversion;
+        const microWave = Math.sin(session * 0.7 + barInSession * 1.35) * (regime === "range" ? 0.00165 : 0.0007);
+        const noiseScale = regime === "squeeze" && barInSession < 4 ? 0.0018 : 0.0042;
+        const microNoise = (random() - 0.5) * (noiseScale - Math.min(progress, 1 - progress) * 0.0011);
+        const meanReversion = ((sessionOpen - open) / sessionOpen) * (regime === "range" ? 0.11 : 0.028);
+        let structure = 0;
+        if (regime === "trend") {
+          structure = direction * 0.00048;
+          if (barInSession === 3 || barInSession === 7) structure -= direction * 0.00225;
+          if (barInSession === 4 || barInSession === 8) structure += direction * 0.0014;
+        } else if (regime === "reversal") {
+          structure = barInSession < 2
+            ? -direction * 0.0019
+            : barInSession < 9
+              ? direction * 0.00105
+              : direction * 0.00025;
+        } else if (regime === "squeeze") {
+          structure = barInSession < 3
+            ? -((open - sessionOpen) / sessionOpen) * 0.18
+            : barInSession === 3
+              ? direction * 0.0048
+              : direction * 0.00062;
+        } else {
+          structure = -((open - sessionOpen) / sessionOpen) * 0.08;
+        }
+        const driftShare = regime === "range" ? sessionReturn / 26 : sessionReturn / 16;
+        const barReturn = driftShare + structure + openingPulse + closingPulse + microWave + microNoise + meanReversion;
         const close = Math.max(18, open * (1 + barReturn));
         const range = 0.0012 + random() * 0.0031;
         const high = Math.max(open, close) * (1 + range * (0.35 + random() * 0.6));
         const low = Math.min(open, close) * (1 - range * (0.35 + random() * 0.6));
         const uShape = Math.pow(Math.abs(progress - 0.5) * 2, 1.5);
+        const catalystVolume =
+          (regime === "trend" && barInSession < 2) ||
+          (regime === "squeeze" && barInSession === 3) ||
+          (regime === "reversal" && barInSession === 2)
+            ? 1.45
+            : 1;
         const volume = Math.round(
-          1_900_000 * (0.82 + uShape * 2.1) * (0.72 + random() * 0.72) * (1 + Math.abs(barReturn) * 42),
+          1_900_000 * (0.82 + uShape * 2.1) * (0.72 + random() * 0.72) * (1 + Math.abs(barReturn) * 42) * catalystVolume,
         );
 
         raw.push({
@@ -284,15 +384,34 @@ function generateMarketData(): MarketBar[] {
   const returns = closes.map((close, index) => index === 0 ? 0 : close / closes[index - 1] - 1);
   let fast = closes[0];
   let slow = closes[0];
+  let ema12 = closes[0];
+  let ema26 = closes[0];
+  let macdSignal = 0;
   let avgGain = 0;
   let avgLoss = 0;
+  let atr = 0;
+  let smoothedPlusDm = 0;
+  let smoothedMinusDm = 0;
+  let adx = 18;
   let activeSession = "";
   let cumulativeTypicalVolume = 0;
   let cumulativeVolume = 0;
+  let openingHigh = raw[0].high;
+  let openingLow = raw[0].low;
+  let runningSessionHigh = raw[0].open;
+  let runningSessionLow = raw[0].open;
+  let priorHigh = raw[0].high;
+  let priorLow = raw[0].low;
+  let priorClose = raw[0].open;
+  const bandWidths: number[] = [];
 
   return raw.map((bar, index) => {
     fast = index === 0 ? bar.close : bar.close * 0.2 + fast * 0.8;
     slow = index === 0 ? bar.close : bar.close * (2 / 22) + slow * (20 / 22);
+    ema12 = index === 0 ? bar.close : bar.close * (2 / 13) + ema12 * (11 / 13);
+    ema26 = index === 0 ? bar.close : bar.close * (2 / 27) + ema26 * (25 / 27);
+    const macd = ema12 - ema26;
+    macdSignal = index === 0 ? macd : macd * 0.2 + macdSignal * 0.8;
     const change = index === 0 ? 0 : bar.close - closes[index - 1];
     const gain = Math.max(0, change);
     const loss = Math.max(0, -change);
@@ -317,10 +436,48 @@ function generateMarketData(): MarketBar[] {
       returnWindow.reduce((sum, value) => sum + (value - returnMean) ** 2, 0) / returnWindow.length,
     );
 
+    const previousBar = raw[Math.max(0, index - 1)];
+    const trueRange = index === 0
+      ? bar.high - bar.low
+      : Math.max(bar.high - bar.low, Math.abs(bar.high - previousBar.close), Math.abs(bar.low - previousBar.close));
+    const upMove = index === 0 ? 0 : bar.high - previousBar.high;
+    const downMove = index === 0 ? 0 : previousBar.low - bar.low;
+    const plusDm = upMove > downMove && upMove > 0 ? upMove : 0;
+    const minusDm = downMove > upMove && downMove > 0 ? downMove : 0;
+    if (index < 14) {
+      atr = (atr * index + trueRange) / (index + 1);
+      smoothedPlusDm = (smoothedPlusDm * index + plusDm) / (index + 1);
+      smoothedMinusDm = (smoothedMinusDm * index + minusDm) / (index + 1);
+    } else {
+      atr = (atr * 13 + trueRange) / 14;
+      smoothedPlusDm = (smoothedPlusDm * 13 + plusDm) / 14;
+      smoothedMinusDm = (smoothedMinusDm * 13 + minusDm) / 14;
+    }
+    const plusDi = atr === 0 ? 0 : (smoothedPlusDm / atr) * 100;
+    const minusDi = atr === 0 ? 0 : (smoothedMinusDm / atr) * 100;
+    const dx = plusDi + minusDi === 0 ? 0 : (Math.abs(plusDi - minusDi) / (plusDi + minusDi)) * 100;
+    adx = index < 14 ? (adx * index + dx) / (index + 1) : (adx * 13 + dx) / 14;
+    const directionalIndex = clamp((plusDi - minusDi) / 38, -1, 1);
+
     if (bar.date !== activeSession) {
+      if (activeSession) {
+        priorHigh = runningSessionHigh;
+        priorLow = runningSessionLow;
+        priorClose = raw[index - 1].close;
+      }
       activeSession = bar.date;
       cumulativeTypicalVolume = 0;
       cumulativeVolume = 0;
+      openingHigh = bar.high;
+      openingLow = bar.low;
+      runningSessionHigh = bar.open;
+      runningSessionLow = bar.open;
+    }
+    const sessionHighBefore = runningSessionHigh;
+    const sessionLowBefore = runningSessionLow;
+    if (bar.barInSession === 0) {
+      openingHigh = bar.high;
+      openingLow = bar.low;
     }
     const typical = (bar.high + bar.low + bar.close) / 3;
     cumulativeTypicalVolume += typical * bar.volume;
@@ -329,6 +486,22 @@ function generateMarketData(): MarketBar[] {
     const averageVolume = volumeWindow.length
       ? volumeWindow.reduce((sum, value) => sum + value.volume, 0) / volumeWindow.length
       : bar.volume;
+    const rollingWindow = raw.slice(Math.max(0, index - 26), index);
+    const rollingHigh = rollingWindow.length ? Math.max(...rollingWindow.map((value) => value.high)) : bar.high;
+    const rollingLow = rollingWindow.length ? Math.min(...rollingWindow.map((value) => value.low)) : bar.low;
+    const bandWidth = mean === 0 ? 0 : (deviation * 4) / mean;
+    const priorBandWidths = bandWidths.slice(Math.max(0, bandWidths.length - 26));
+    const averageBandWidth = priorBandWidths.length
+      ? priorBandWidths.reduce((sum, value) => sum + value, 0) / priorBandWidths.length
+      : Math.max(0.0001, bandWidth);
+    const bandWidthRatio = clamp(bandWidth / Math.max(0.0001, averageBandWidth), 0.2, 3);
+    bandWidths.push(bandWidth);
+    const candleRange = Math.max(0.0001, bar.high - bar.low);
+    const closeLocation = clamp(((bar.close - bar.low) / candleRange) * 2 - 1, -1, 1);
+    const bodyStrength = clamp((bar.close - bar.open) / candleRange, -1, 1);
+
+    runningSessionHigh = Math.max(runningSessionHigh, bar.high);
+    runningSessionLow = Math.min(runningSessionLow, bar.low);
 
     return {
       ...bar,
@@ -341,35 +514,179 @@ function generateMarketData(): MarketBar[] {
       volatility,
       vwap: cumulativeTypicalVolume / Math.max(1, cumulativeVolume),
       volumeRatio: clamp(bar.volume / Math.max(1, averageVolume), 0, 3),
+      atr,
+      macd,
+      macdSignal,
+      adx,
+      directionalIndex,
+      openingHigh,
+      openingLow,
+      sessionHighBefore,
+      sessionLowBefore,
+      priorHigh,
+      priorLow,
+      priorClose,
+      rollingHigh,
+      rollingLow,
+      bandWidthRatio,
+      rangeExpansion: clamp(trueRange / Math.max(0.0001, atr), 0, 4),
+      closeLocation,
+      bodyStrength,
     };
   });
 }
 
 const MARKET_DATA = generateMarketData();
 
-function scoreBar(bar: MarketBar, weights: ModelWeights) {
-  const trend = clamp(((bar.ema9 - bar.ema21) / bar.close) * 130, -1, 1);
-  const rsiEdge = clamp((50 - bar.rsi) / 24, -1, 1);
-  const momentum = clamp(bar.momentum / 0.018, -1, 1);
-  const volatility = clamp((0.006 - bar.volatility) / 0.006, -1, 1);
-  const vwap = clamp(((bar.close - bar.vwap) / bar.close) * 150, -1, 1);
-  const volume = clamp((bar.volumeRatio - 1) * 0.72, -1, 1);
-  const score =
+function scoreBar(bar: MarketBar, weights: ModelWeights, explain = true) {
+  const atrUnit = Math.max(bar.atr, bar.close * 0.0015);
+  const emaDirection = clamp((bar.ema9 - bar.ema21) / atrUnit, -1, 1);
+  const macdDirection = clamp((bar.macd - bar.macdSignal) / (atrUnit * 0.34), -1, 1);
+  const trend = clamp(emaDirection * 0.48 + bar.directionalIndex * 0.32 + macdDirection * 0.2, -1, 1);
+  const trendRegime = clamp((bar.adx - 17) / 19, 0, 1);
+  const rsiTrend = clamp((bar.rsi - 50) / 23, -1, 1);
+  const rsiReversion = clamp((50 - bar.rsi) / 27, -1, 1);
+  const rsiEdge = trendRegime > 0.38 ? rsiTrend : rsiReversion;
+  const momentum = clamp(
+    bar.momentum / 0.014 * 0.56 + bar.bodyStrength * 0.25 + macdDirection * 0.19,
+    -1,
+    1,
+  );
+  const volatility = clamp(
+    Math.sign(bar.bodyStrength || momentum) * (bar.rangeExpansion - 0.85) * 0.62,
+    -1,
+    1,
+  );
+  const vwap = clamp((bar.close - bar.vwap) / (atrUnit * 1.15), -1, 1);
+  const volume = clamp(bar.bodyStrength * Math.max(0, bar.volumeRatio - 0.62) * 0.78, -1, 1);
+
+  let orb = 0;
+  if (bar.barInSession >= 1 && bar.barInSession <= 7) {
+    if (bar.close > bar.openingHigh) {
+      orb = clamp(
+        (bar.close - bar.openingHigh) / atrUnit * 0.82 + bar.closeLocation * 0.24 + Math.max(0, bar.volumeRatio - 1) * 0.2,
+        0,
+        1,
+      );
+    } else if (bar.close < bar.openingLow) {
+      orb = -clamp(
+        (bar.openingLow - bar.close) / atrUnit * 0.82 - bar.closeLocation * 0.24 + Math.max(0, bar.volumeRatio - 1) * 0.2,
+        0,
+        1,
+      );
+    }
+  }
+
+  const longTrend = trend > 0.16 && bar.ema9 >= bar.ema21;
+  const shortTrend = trend < -0.16 && bar.ema9 <= bar.ema21;
+  const touchedLongValue = bar.low <= Math.max(bar.ema9, bar.vwap) * 1.0015;
+  const touchedShortValue = bar.high >= Math.min(bar.ema9, bar.vwap) * 0.9985;
+  const pullback = longTrend && touchedLongValue && bar.close > bar.ema9 && bar.close > bar.vwap && bar.bodyStrength > 0.08
+    ? clamp(0.48 + bar.closeLocation * 0.28 + Math.max(0, bar.volumeRatio - 0.8) * 0.18, 0, 1)
+    : shortTrend && touchedShortValue && bar.close < bar.ema9 && bar.close < bar.vwap && bar.bodyStrength < -0.08
+      ? -clamp(0.48 - bar.closeLocation * 0.28 + Math.max(0, bar.volumeRatio - 0.8) * 0.18, 0, 1)
+      : 0;
+
+  const squeezePressure = clamp((1.18 - bar.bandWidthRatio) * 0.95, 0, 1);
+  const squeeze = clamp(
+    Math.sign(bar.bodyStrength || momentum) *
+      squeezePressure *
+      clamp((bar.rangeExpansion - 0.78) * 0.72, 0, 1) *
+      (0.65 + Math.max(0, bar.volumeRatio - 0.8) * 0.25),
+    -1,
+    1,
+  );
+
+  const supportTouched = bar.low <= Math.max(bar.priorLow, bar.rollingLow) * 1.0025 || bar.low <= bar.sessionLowBefore * 1.0015;
+  const resistanceTouched = bar.high >= Math.min(bar.priorHigh, bar.rollingHigh) * 0.9975 || bar.high >= bar.sessionHighBefore * 0.9985;
+  const longRejection = supportTouched && bar.closeLocation > 0.28 && bar.bodyStrength > 0;
+  const shortRejection = resistanceTouched && bar.closeLocation < -0.28 && bar.bodyStrength < 0;
+  const levelBreakout = bar.close > Math.max(bar.priorHigh, bar.rollingHigh)
+    ? clamp((bar.close - Math.max(bar.priorHigh, bar.rollingHigh)) / atrUnit, 0, 1)
+    : bar.close < Math.min(bar.priorLow, bar.rollingLow)
+      ? -clamp((Math.min(bar.priorLow, bar.rollingLow) - bar.close) / atrUnit, 0, 1)
+      : 0;
+  const levels = longRejection
+    ? clamp(0.52 + bar.closeLocation * 0.34, 0, 1)
+    : shortRejection
+      ? -clamp(0.52 - bar.closeLocation * 0.34, 0, 1)
+      : levelBreakout;
+  const pattern = clamp(
+    bar.bodyStrength * 0.62 + bar.closeLocation * 0.25 + Math.sign(bar.bodyStrength) * Math.max(0, bar.rangeExpansion - 1) * 0.18,
+    -1,
+    1,
+  );
+
+  const factors = {
+    trend,
+    rsi: rsiEdge,
+    momentum,
+    volatility,
+    vwap,
+    volume,
+    orb,
+    pullback,
+    squeeze,
+    levels,
+    pattern,
+  };
+  const rawScore =
     trend * weights.trend +
     rsiEdge * weights.rsi +
     momentum * weights.momentum +
     volatility * weights.volatility +
     vwap * weights.vwap +
-    volume * weights.volume;
+    volume * weights.volume +
+    orb * weights.orb +
+    pullback * weights.pullback +
+    squeeze * weights.squeeze +
+    levels * weights.levels +
+    pattern * weights.pattern;
+
+  const direction = Math.sign(rawScore);
+  const directionalFactors = [trend, rsiEdge, momentum, vwap, volume, orb, pullback, squeeze, levels, pattern];
+  const confluence = direction === 0
+    ? 0
+    : directionalFactors.filter((factor) => Math.sign(factor) === direction && Math.abs(factor) >= 0.16).length;
+  const regime = bar.bandWidthRatio < 0.76
+    ? "SQUEEZE"
+    : trendRegime >= 0.42
+      ? "TREND"
+      : "RANGE";
+  const agreementBoost = 0.78 + Math.min(6, confluence) * 0.075;
+  const score = clamp(rawScore * 2.15 * agreementBoost, -1, 1);
+  let setup = "Multi-signal confluence";
+  if (explain) {
+    const labels: Array<[keyof typeof factors, string]> = [
+      ["orb", "Opening range breakout"],
+      ["pullback", "VWAP / EMA pullback"],
+      ["squeeze", "Bollinger squeeze"],
+      ["levels", "Key-level reaction"],
+      ["momentum", "Momentum continuation"],
+      ["trend", "EMA / ADX trend"],
+      ["vwap", "VWAP alignment"],
+      ["volume", "Volume confirmation"],
+      ["pattern", "Confirmation candle"],
+      ["rsi", "RSI regime signal"],
+      ["volatility", "Range expansion"],
+    ];
+    labels.sort((a, b) => Math.abs(factors[b[0]] * weights[b[0]]) - Math.abs(factors[a[0]] * weights[a[0]]));
+    setup = labels[0][1];
+  }
 
   return {
-    score: clamp(score, -1, 1),
-    factors: { trend, rsi: rsiEdge, momentum, volatility, vwap, volume },
+    score,
+    factors,
+    confluence,
+    regime,
+    setup,
+    stopAtr: regime === "SQUEEZE" ? 1.05 : regime === "TREND" ? 0.9 : 0.72,
+    rewardRisk: regime === "SQUEEZE" ? 2.35 : regime === "TREND" ? 1.85 : 1.35,
   };
 }
 
 function intradayEntryThreshold(weights: ModelWeights) {
-  return clamp(weights.threshold * 0.45, 0.065, 0.105);
+  return clamp(weights.threshold * 0.75, 0.14, 0.24);
 }
 
 
@@ -400,6 +717,8 @@ function runBacktest(
       roundTrips: 0,
       tradesPerDay: 0,
       averageHoldBars: 0,
+      averageWeekReturn: 0,
+      positiveWeekRate: 0,
     };
   }
 
@@ -407,6 +726,10 @@ function runBacktest(
   let shares = 0;
   let entryPrice = 0;
   let entryIndex = -1;
+  let entryRisk = 0;
+  let stopPrice = 0;
+  let targetPrice = 0;
+  let maxHoldBars = 4;
   let peak = startingCapital;
   let maxDrawdown = 0;
   let previousEquity = startingCapital;
@@ -422,7 +745,12 @@ function runBacktest(
   let currentSession = "";
   let entriesThisSession = 0;
   let cooldownBars = 0;
+  let dailyStartEquity = startingCapital;
+  let dailyLocked = false;
+  let completedSessions = 0;
+  let weekStartEquity = startingCapital;
   const sessions = new Set<string>();
+  const weeklyReturns: number[] = [];
   const trades: Trade[] = [];
   const equity: number[] = [];
   const scores: number[] = [];
@@ -430,48 +758,90 @@ function runBacktest(
   const buyHoldEquity = collectSeries ? data.map((bar) => holdShares * bar.close) : [];
 
   const commission = (notional: number) => 0.35 + notional * 0.00002;
-  const factorReason = (bar: MarketBar) => {
-    const factors = scoreBar(bar, weights).factors;
-    const labels: Array<[keyof typeof factors, string]> = [
-      ["trend", "EMA trend"],
-      ["rsi", "RSI reversal"],
-      ["momentum", "Momentum"],
-      ["vwap", "VWAP displacement"],
-      ["volume", "Volume expansion"],
-      ["volatility", "Volatility regime"],
-    ];
-    labels.sort((a, b) => Math.abs(factors[b[0]]) - Math.abs(factors[a[0]]));
-    return `${labels[0][1]} setup`;
-  };
+  const factorReason = (scored: ReturnType<typeof scoreBar>) =>
+    `${scored.setup} / ${scored.regime.toLowerCase()} / ${scored.confluence} confirmations`;
 
   data.forEach((bar, index) => {
     sessions.add(bar.date);
     if (bar.date !== currentSession) {
+      if (currentSession) {
+        completedSessions += 1;
+        if (completedSessions % 5 === 0) {
+          weeklyReturns.push(previousEquity / weekStartEquity - 1);
+          weekStartEquity = previousEquity;
+        }
+      }
       currentSession = bar.date;
       entriesThisSession = 0;
       cooldownBars = 0;
+      dailyStartEquity = cash + shares * bar.open;
+      dailyLocked = false;
     }
     if (cooldownBars > 0) cooldownBars -= 1;
 
-    const scored = scoreBar(bar, weights);
+    const scored = scoreBar(bar, weights, collectTrades);
     const score = scored.score;
     latestScore = score;
     if (collectSeries) scores.push(score);
-    const confidence = Math.round(50 + Math.min(0.49, Math.abs(score)) * 100);
-    const longReturn = shares > 0 && entryPrice > 0 ? bar.close / entryPrice - 1 : 0;
-    const shortReturn = shares < 0 && entryPrice > 0 ? entryPrice / bar.close - 1 : 0;
+    const confidence = Math.round(clamp(48 + Math.abs(score) * 35 + scored.confluence * 3.2, 50, 98));
     const heldBars = entryIndex >= 0 ? index - entryIndex : 0;
     const sessionClose = bar.barInSession === 12;
+    const threshold = intradayEntryThreshold(weights);
+    let exitReason = "";
+    let exitFill = 0;
 
-    if (
-      shares > 0 &&
-      (sessionClose || longReturn >= 0.0065 || longReturn <= -0.0048 || heldBars >= 2 || score < -0.015)
-    ) {
-      const fill = bar.close * 0.9998;
-      const notional = shares * fill;
+    if (shares > 0) {
+      const stopHit = bar.low <= stopPrice;
+      const targetHit = bar.high >= targetPrice;
+      if (stopHit) {
+        exitReason = stopPrice >= entryPrice ? "Protected stop" : "ATR risk stop";
+        exitFill = stopPrice * 0.99985;
+      } else if (targetHit) {
+        exitReason = "Risk / reward target";
+        exitFill = targetPrice * 0.9999;
+      } else if (sessionClose) {
+        exitReason = "Closing bell";
+        exitFill = bar.close * 0.99985;
+      } else if (heldBars >= maxHoldBars) {
+        exitReason = "Time stop";
+        exitFill = bar.close * 0.99985;
+      } else if (score < -threshold * 0.72 && scored.confluence >= 3) {
+        exitReason = "Confluence reversed";
+        exitFill = bar.close * 0.99985;
+      } else if (heldBars >= 1) {
+        if (bar.high >= entryPrice + entryRisk) stopPrice = Math.max(stopPrice, entryPrice * 1.0002);
+        stopPrice = Math.max(stopPrice, bar.close - bar.atr * (scored.regime === "TREND" ? 0.78 : 0.62));
+      }
+    } else if (shares < 0) {
+      const stopHit = bar.high >= stopPrice;
+      const targetHit = bar.low <= targetPrice;
+      if (stopHit) {
+        exitReason = stopPrice <= entryPrice ? "Protected stop" : "ATR risk stop";
+        exitFill = stopPrice * 1.00015;
+      } else if (targetHit) {
+        exitReason = "Risk / reward target";
+        exitFill = targetPrice * 1.0001;
+      } else if (sessionClose) {
+        exitReason = "Closing bell";
+        exitFill = bar.close * 1.00015;
+      } else if (heldBars >= maxHoldBars) {
+        exitReason = "Time stop";
+        exitFill = bar.close * 1.00015;
+      } else if (score > threshold * 0.72 && scored.confluence >= 3) {
+        exitReason = "Confluence reversed";
+        exitFill = bar.close * 1.00015;
+      } else if (heldBars >= 1) {
+        if (bar.low <= entryPrice - entryRisk) stopPrice = Math.min(stopPrice, entryPrice * 0.9998);
+        stopPrice = Math.min(stopPrice, bar.close + bar.atr * (scored.regime === "TREND" ? 0.78 : 0.62));
+      }
+    }
+
+    if (shares > 0 && exitReason) {
+      const quantity = shares;
+      const notional = quantity * exitFill;
       const fee = commission(notional);
       const proceeds = notional - fee;
-      const pnl = (fill - entryPrice) * shares - fee - commission(shares * entryPrice);
+      const pnl = (exitFill - entryPrice) * quantity - fee - commission(quantity * entryPrice);
       cash += proceeds;
       exits += 1;
       totalHoldBars += heldBars;
@@ -482,27 +852,26 @@ function runBacktest(
         time: bar.time,
         timestamp: bar.timestamp,
         side: "SELL",
-        price: fill,
-        shares,
+        price: exitFill,
+        shares: quantity,
         value: proceeds,
         pnl,
         confidence,
-        reason: sessionClose ? "Closing bell" : longReturn >= 0.0065 ? "Profit target" : longReturn <= -0.0048 ? "Risk stop" : heldBars >= 2 ? "Time stop" : "Signal reversed",
+        reason: exitReason,
       });
       shares = 0;
       entryPrice = 0;
       entryIndex = -1;
+      entryRisk = 0;
+      stopPrice = 0;
+      targetPrice = 0;
       cooldownBars = 1;
-    } else if (
-      shares < 0 &&
-      (sessionClose || shortReturn >= 0.0065 || shortReturn <= -0.0048 || heldBars >= 2 || score > 0.015)
-    ) {
+    } else if (shares < 0 && exitReason) {
       const quantity = Math.abs(shares);
-      const fill = bar.close * 1.0002;
-      const notional = quantity * fill;
+      const notional = quantity * exitFill;
       const fee = commission(notional);
       const cost = notional + fee;
-      const pnl = (entryPrice - fill) * quantity - fee - commission(quantity * entryPrice);
+      const pnl = (entryPrice - exitFill) * quantity - fee - commission(quantity * entryPrice);
       cash -= cost;
       exits += 1;
       totalHoldBars += heldBars;
@@ -513,32 +882,45 @@ function runBacktest(
         time: bar.time,
         timestamp: bar.timestamp,
         side: "COVER",
-        price: fill,
+        price: exitFill,
         shares: quantity,
         value: cost,
         pnl,
         confidence,
-        reason: sessionClose ? "Closing bell" : shortReturn >= 0.0065 ? "Profit target" : shortReturn <= -0.0048 ? "Risk stop" : heldBars >= 2 ? "Time stop" : "Signal reversed",
+        reason: exitReason,
       });
       shares = 0;
       entryPrice = 0;
       entryIndex = -1;
+      entryRisk = 0;
+      stopPrice = 0;
+      targetPrice = 0;
       cooldownBars = 1;
     } else if (
       index > 30 &&
       shares === 0 &&
       cooldownBars === 0 &&
-      entriesThisSession < 6 &&
+      !dailyLocked &&
+      entriesThisSession < 5 &&
       bar.barInSession >= 1 &&
       bar.barInSession <= 10 &&
-      bar.volumeRatio > 0.4
+      bar.volumeRatio > 0.58 &&
+      scored.confluence >= (bar.volumeRatio >= 1.15 ? 2 : 3) &&
+      (Math.abs(scored.factors.orb) >= 0.24 ||
+        Math.abs(scored.factors.pullback) >= 0.24 ||
+        Math.abs(scored.factors.squeeze) >= 0.18 ||
+        Math.abs(scored.factors.levels) >= 0.36 ||
+        scored.confluence >= 5)
     ) {
-      const entryThreshold = intradayEntryThreshold(weights);
       const portfolioValue = cash;
-      const allocation = portfolioValue * 0.46;
-      if (score > entryThreshold) {
-        const fill = bar.close * 1.0002;
-        const quantity = Math.floor(allocation / fill);
+      const stopDistance = Math.max(bar.atr * scored.stopAtr, bar.close * 0.0026);
+      const riskFraction = scored.regime === "RANGE" ? 0.006 : scored.regime === "SQUEEZE" ? 0.0095 : 0.008;
+      const riskBudget = portfolioValue * riskFraction;
+      const allocation = portfolioValue * (scored.regime === "RANGE" ? 0.58 : 0.76);
+      const dynamicThreshold = threshold * (bar.barInSession >= 9 ? 1.08 : 1);
+      if (score > dynamicThreshold) {
+        const fill = bar.close * 1.00015;
+        const quantity = Math.floor(Math.min(allocation / fill, riskBudget / stopDistance));
         if (quantity > 0) {
           const notional = quantity * fill;
           const fee = commission(notional);
@@ -548,6 +930,10 @@ function runBacktest(
             shares = quantity;
             entryPrice = fill;
             entryIndex = index;
+            entryRisk = stopDistance;
+            stopPrice = fill - stopDistance;
+            targetPrice = fill + stopDistance * scored.rewardRisk;
+            maxHoldBars = scored.regime === "TREND" ? 5 : scored.regime === "SQUEEZE" ? 4 : 3;
             entriesThisSession += 1;
             longEntries += 1;
             if (collectTrades) trades.push({
@@ -561,13 +947,13 @@ function runBacktest(
               value: cost,
               pnl: null,
               confidence,
-              reason: collectTrades ? factorReason(bar) : "Indicator setup",
+              reason: collectTrades ? factorReason(scored) : "Confluence setup",
             });
           }
         }
-      } else if (score < -entryThreshold) {
-        const fill = bar.close * 0.9998;
-        const quantity = Math.floor(allocation / fill);
+      } else if (score < -dynamicThreshold) {
+        const fill = bar.close * 0.99985;
+        const quantity = Math.floor(Math.min(allocation / fill, riskBudget / stopDistance));
         if (quantity > 0) {
           const notional = quantity * fill;
           const fee = commission(notional);
@@ -576,6 +962,10 @@ function runBacktest(
           shares = -quantity;
           entryPrice = fill;
           entryIndex = index;
+          entryRisk = stopDistance;
+          stopPrice = fill + stopDistance;
+          targetPrice = fill - stopDistance * scored.rewardRisk;
+          maxHoldBars = scored.regime === "TREND" ? 5 : scored.regime === "SQUEEZE" ? 4 : 3;
           entriesThisSession += 1;
           shortEntries += 1;
           if (collectTrades) trades.push({
@@ -589,7 +979,7 @@ function runBacktest(
             value: proceeds,
             pnl: null,
             confidence,
-            reason: collectTrades ? factorReason(bar) : "Indicator setup",
+            reason: collectTrades ? factorReason(scored) : "Confluence setup",
           });
         }
       }
@@ -599,6 +989,7 @@ function runBacktest(
     if (collectSeries) equity.push(portfolioValue);
     peak = Math.max(peak, portfolioValue);
     maxDrawdown = Math.min(maxDrawdown, portfolioValue / peak - 1);
+    if (portfolioValue <= dailyStartEquity * 0.982) dailyLocked = true;
     if (index > 0) {
       const barReturn = portfolioValue / previousEquity - 1;
       returnCount += 1;
@@ -613,6 +1004,11 @@ function runBacktest(
   const strategyReturn = finalValue / startingCapital - 1;
   const buyHoldReturn = data[data.length - 1].close / data[0].close - 1;
   const returnDeviation = Math.sqrt(returnSquaredDelta / Math.max(1, returnCount));
+  if (weeklyReturns.length < Math.ceil(sessions.size / 5)) {
+    weeklyReturns.push(finalValue / weekStartEquity - 1);
+  }
+  const averageWeekReturn = weeklyReturns.reduce((sum, value) => sum + value, 0) / Math.max(1, weeklyReturns.length);
+  const positiveWeekRate = weeklyReturns.filter((value) => value > 0).length / Math.max(1, weeklyReturns.length);
   const entryThreshold = intradayEntryThreshold(weights);
   const signal = latestScore > entryThreshold ? "BUY" : latestScore < -entryThreshold ? "SHORT" : "HOLD";
 
@@ -629,30 +1025,35 @@ function runBacktest(
     buyHoldEquity,
     scores,
     signal,
-    confidence: Math.round(50 + Math.min(0.49, Math.abs(latestScore)) * 100),
+    confidence: Math.round(clamp(50 + Math.abs(latestScore) * 45, 50, 98)),
     longEntries,
     shortEntries,
     roundTrips: exits,
     tradesPerDay: exits / Math.max(1, sessions.size),
     averageHoldBars: exits === 0 ? 0 : totalHoldBars / exits,
+    averageWeekReturn,
+    positiveWeekRate,
   };
 }
 
 function oracleAction(data: MarketBar[], index: number): Position {
-  let futureIndex = index;
-  for (let offset = 1; offset <= 4 && index + offset < data.length; offset += 1) {
+  const futureBars: MarketBar[] = [];
+  for (let offset = 1; offset <= 5 && index + offset < data.length; offset += 1) {
     if (data[index + offset].date !== data[index].date) break;
-    futureIndex = index + offset;
+    futureBars.push(data[index + offset]);
   }
-  if (futureIndex <= index) return "FLAT";
-  const futureReturn = data[futureIndex].close / data[index].close - 1;
-  if (futureReturn > 0.0025) return "LONG";
-  if (futureReturn < -0.0025) return "SHORT";
+  if (futureBars.length === 0) return "FLAT";
+  const entry = data[index].close;
+  const longOpportunity = Math.max(...futureBars.map((bar) => bar.high / entry - 1));
+  const shortOpportunity = Math.max(...futureBars.map((bar) => entry / bar.low - 1));
+  const minimumMove = 0.0032;
+  if (longOpportunity > minimumMove && longOpportunity > shortOpportunity + 0.0008) return "LONG";
+  if (shortOpportunity > minimumMove && shortOpportunity > longOpportunity + 0.0008) return "SHORT";
   return "FLAT";
 }
 
 function policyAction(bar: MarketBar, weights: ModelWeights): Position {
-  const score = scoreBar(bar, weights).score;
+  const score = scoreBar(bar, weights, false).score;
   const threshold = intradayEntryThreshold(weights);
   if (score > threshold) return "LONG";
   if (score < -threshold) return "SHORT";
@@ -663,7 +1064,7 @@ function teacherAgreement(data: MarketBar[], weights: ModelWeights) {
   if (data.length < 30) return 0;
   let matched = 0;
   let total = 0;
-  for (let index = 22; index < data.length - 4; index += 1) {
+  for (let index = 22; index < data.length - 5; index += 1) {
     const teacher = oracleAction(data, index);
     const policy = policyAction(data[index], weights);
     matched += teacher === policy ? 1 : 0;
@@ -685,36 +1086,55 @@ function evaluateModel(data: MarketBar[], weights: ModelWeights) {
   const trainingResult = runBacktest(trainingData, weights, STARTING_CAPITAL, false);
   const validationResult = runBacktest(validationData, weights, STARTING_CAPITAL, false);
   const agreement = teacherAgreement(trainingData, weights);
-  const turnoverPenalty = Math.max(0, trainingResult.roundTrips / Math.max(1, trainingData.length / 13) - 4.2);
-  const undertradingPenalty = Math.max(0, 1.5 - validationResult.tradesPerDay);
-  const cadenceReward = Math.min(2.5, validationResult.tradesPerDay) * 0.008;
+  const turnoverPenalty = Math.max(0, trainingResult.tradesPerDay - 3.2);
+  const undertradingPenalty = Math.max(0, 0.8 - validationResult.tradesPerDay);
+  const cadenceReward = Math.min(2.2, validationResult.tradesPerDay) * 0.004;
   const objective =
-    validationResult.strategyReturn * 0.52 +
-    validationResult.alpha * 0.38 +
-    validationResult.sharpe * 0.018 -
-    Math.abs(validationResult.maxDrawdown) * 0.32 +
-    trainingResult.strategyReturn * 0.12 +
-    agreement * 0.12 -
-    turnoverPenalty * 0.015 -
-    undertradingPenalty * 0.03 +
+    validationResult.strategyReturn * 0.58 +
+    validationResult.alpha * 0.42 +
+    validationResult.averageWeekReturn * 1.4 +
+    validationResult.positiveWeekRate * 0.025 +
+    validationResult.sharpe * 0.012 -
+    Math.abs(validationResult.maxDrawdown) * 0.38 +
+    trainingResult.strategyReturn * 0.1 +
+    agreement * 0.08 -
+    turnoverPenalty * 0.02 -
+    undertradingPenalty * 0.025 +
     cadenceReward;
 
   return { objective, agreement, trainingResult, validationResult };
 }
 
 function teacherSeedModel(data: MarketBar[], current: ModelWeights): ModelWeights {
-  const totals = { trend: 0, rsi: 0, momentum: 0, volatility: 0, vwap: 0, volume: 0 };
+  const totals = {
+    trend: 0,
+    rsi: 0,
+    momentum: 0,
+    volatility: 0,
+    vwap: 0,
+    volume: 0,
+    orb: 0,
+    pullback: 0,
+    squeeze: 0,
+    levels: 0,
+    pattern: 0,
+  };
   let examples = 0;
-  for (let index = 22; index < data.length - 4; index += 1) {
+  for (let index = 22; index < data.length - 5; index += 1) {
     const teacher = oracleAction(data, index);
     const target = teacher === "LONG" ? 1 : teacher === "SHORT" ? -1 : 0;
-    const factors = scoreBar(data[index], current).factors;
+    const factors = scoreBar(data[index], current, false).factors;
     totals.trend += factors.trend * target;
     totals.rsi += factors.rsi * target;
     totals.momentum += factors.momentum * target;
     totals.volatility += factors.volatility * target;
     totals.vwap += factors.vwap * target;
     totals.volume += factors.volume * target;
+    totals.orb += factors.orb * target;
+    totals.pullback += factors.pullback * target;
+    totals.squeeze += factors.squeeze * target;
+    totals.levels += factors.levels * target;
+    totals.pattern += factors.pattern * target;
     examples += 1;
   }
 
@@ -726,8 +1146,13 @@ function teacherSeedModel(data: MarketBar[], current: ModelWeights): ModelWeight
     volatility: Math.max(0.01, totals.volatility / examples),
     vwap: Math.max(0.02, totals.vwap / examples),
     volume: Math.max(0.01, totals.volume / examples),
+    orb: Math.max(0.02, totals.orb / examples),
+    pullback: Math.max(0.02, totals.pullback / examples),
+    squeeze: Math.max(0.015, totals.squeeze / examples),
+    levels: Math.max(0.015, totals.levels / examples),
+    pattern: Math.max(0.015, totals.pattern / examples),
   };
-  const sum = learned.trend + learned.rsi + learned.momentum + learned.volatility + learned.vwap + learned.volume;
+  const sum = Object.values(learned).reduce((total, value) => total + value, 0);
   const blend = 0.34;
   return normalizeModel({
     trend: current.trend * (1 - blend) + (learned.trend / sum) * blend,
@@ -736,7 +1161,12 @@ function teacherSeedModel(data: MarketBar[], current: ModelWeights): ModelWeight
     volatility: current.volatility * (1 - blend) + (learned.volatility / sum) * blend,
     vwap: current.vwap * (1 - blend) + (learned.vwap / sum) * blend,
     volume: current.volume * (1 - blend) + (learned.volume / sum) * blend,
-    threshold: current.threshold * 0.8 + 0.18 * 0.2,
+    orb: current.orb * (1 - blend) + (learned.orb / sum) * blend,
+    pullback: current.pullback * (1 - blend) + (learned.pullback / sum) * blend,
+    squeeze: current.squeeze * (1 - blend) + (learned.squeeze / sum) * blend,
+    levels: current.levels * (1 - blend) + (learned.levels / sum) * blend,
+    pattern: current.pattern * (1 - blend) + (learned.pattern / sum) * blend,
+    threshold: current.threshold * 0.8 + 0.24 * 0.2,
   });
 }
 
@@ -804,6 +1234,7 @@ function MarketChart({
     averages: true,
     vwap: true,
     bands: true,
+    levels: true,
     rsi: true,
     trades: true,
   });
@@ -973,6 +1404,29 @@ function MarketChart({
       context.lineWidth = 1;
     }
 
+    if (layers.levels) {
+      const drawSessionLevel = (
+        key: "openingHigh" | "openingLow" | "priorHigh" | "priorLow",
+        color: string,
+        dash: number[],
+      ) => {
+        context.beginPath();
+        visible.forEach((bar, index) => {
+          if (index === 0 || visible[index - 1].date !== bar.date) context.moveTo(x(index), yPrice(bar[key]));
+          else context.lineTo(x(index), yPrice(bar[key]));
+        });
+        context.setLineDash(dash);
+        context.strokeStyle = color;
+        context.lineWidth = 1;
+        context.stroke();
+        context.setLineDash([]);
+      };
+      drawSessionLevel("openingHigh", "rgba(240,198,107,0.62)", [5, 4]);
+      drawSessionLevel("openingLow", "rgba(240,198,107,0.62)", [5, 4]);
+      drawSessionLevel("priorHigh", "rgba(169,156,246,0.34)", [2, 5]);
+      drawSessionLevel("priorLow", "rgba(169,156,246,0.34)", [2, 5]);
+    }
+
     if (layers.trades) {
       visible.forEach((bar, index) => {
         const trade = tradeByTimestamp.get(bar.timestamp);
@@ -1110,6 +1564,13 @@ function MarketChart({
           <span className="legend-swatch band" /> Bollinger 20
         </button>
         <button
+          className={layers.levels ? "legend-chip active" : "legend-chip"}
+          onClick={() => toggleLayer("levels")}
+          type="button"
+        >
+          <span className="legend-swatch levels" /> ORB / key levels
+        </button>
+        <button
           className={layers.rsi ? "legend-chip active" : "legend-chip"}
           onClick={() => toggleLayer("rsi")}
           type="button"
@@ -1130,7 +1591,7 @@ function MarketChart({
           ref={canvasRef}
           onPointerMove={pointerMove}
           onPointerLeave={() => setHovered(null)}
-          aria-label="AAPL intraday candlestick chart with EMA, VWAP, Bollinger Bands, RSI, policy score, volume, and trade markers"
+          aria-label="AAPL intraday candlestick chart with EMA, VWAP, Bollinger Bands, opening range, key levels, RSI, ADX-informed policy score, volume, and trade markers"
           role="img"
         />
         {hoverBar && (
@@ -1152,6 +1613,8 @@ function MarketChart({
               <span>Score <b>{visibleScores[hovered ?? 0]?.toFixed(2)}</b></span>
               <span>VWAP <b>{hoverBar.vwap.toFixed(2)}</b></span>
               <span>Vol <b>{compact(hoverBar.volume)} / {hoverBar.volumeRatio.toFixed(1)}x</b></span>
+              <span>ADX <b>{hoverBar.adx.toFixed(1)}</b></span>
+              <span>ORB <b>{hoverBar.openingLow.toFixed(2)}–{hoverBar.openingHigh.toFixed(2)}</b></span>
             </div>
           </div>
         )}
@@ -1351,8 +1814,13 @@ function normalizeModel(value: unknown): ModelWeights {
     volatility: clamp(finiteNumber(model.volatility, INITIAL_MODEL.volatility), 0.01, 0.5),
     vwap: clamp(finiteNumber(model.vwap, INITIAL_MODEL.vwap), 0.02, 0.65),
     volume: clamp(finiteNumber(model.volume, INITIAL_MODEL.volume), 0.01, 0.45),
+    orb: clamp(finiteNumber(model.orb, INITIAL_MODEL.orb), 0.02, 0.7),
+    pullback: clamp(finiteNumber(model.pullback, INITIAL_MODEL.pullback), 0.02, 0.65),
+    squeeze: clamp(finiteNumber(model.squeeze, INITIAL_MODEL.squeeze), 0.015, 0.55),
+    levels: clamp(finiteNumber(model.levels, INITIAL_MODEL.levels), 0.015, 0.5),
+    pattern: clamp(finiteNumber(model.pattern, INITIAL_MODEL.pattern), 0.015, 0.5),
   };
-  const sum = raw.trend + raw.rsi + raw.momentum + raw.volatility + raw.vwap + raw.volume;
+  const sum = Object.values(raw).reduce((total, item) => total + item, 0);
   return {
     trend: raw.trend / sum,
     rsi: raw.rsi / sum,
@@ -1360,8 +1828,33 @@ function normalizeModel(value: unknown): ModelWeights {
     volatility: raw.volatility / sum,
     vwap: raw.vwap / sum,
     volume: raw.volume / sum,
-    threshold: clamp(finiteNumber(model.threshold, INITIAL_MODEL.threshold), 0.1, 0.38),
+    orb: raw.orb / sum,
+    pullback: raw.pullback / sum,
+    squeeze: raw.squeeze / sum,
+    levels: raw.levels / sum,
+    pattern: raw.pattern / sum,
+    threshold: clamp(finiteNumber(model.threshold, INITIAL_MODEL.threshold), 0.18, 0.34),
   };
+}
+
+function migrateModel(value: unknown, version: number): ModelWeights {
+  const saved = normalizeModel(value);
+  if (version >= STATE_VERSION) return saved;
+  const keep = 0.35;
+  return normalizeModel({
+    trend: saved.trend * keep + INITIAL_MODEL.trend * (1 - keep),
+    rsi: saved.rsi * keep + INITIAL_MODEL.rsi * (1 - keep),
+    momentum: saved.momentum * keep + INITIAL_MODEL.momentum * (1 - keep),
+    volatility: saved.volatility * keep + INITIAL_MODEL.volatility * (1 - keep),
+    vwap: saved.vwap * keep + INITIAL_MODEL.vwap * (1 - keep),
+    volume: saved.volume * keep + INITIAL_MODEL.volume * (1 - keep),
+    orb: saved.orb * keep + INITIAL_MODEL.orb * (1 - keep),
+    pullback: saved.pullback * keep + INITIAL_MODEL.pullback * (1 - keep),
+    squeeze: saved.squeeze * keep + INITIAL_MODEL.squeeze * (1 - keep),
+    levels: saved.levels * keep + INITIAL_MODEL.levels * (1 - keep),
+    pattern: saved.pattern * keep + INITIAL_MODEL.pattern * (1 - keep),
+    threshold: saved.threshold * keep + INITIAL_MODEL.threshold * (1 - keep),
+  });
 }
 
 function normalizePaper(value: unknown): PaperAccount {
@@ -1371,6 +1864,9 @@ function normalizePaper(value: unknown): PaperAccount {
     shares: Math.trunc(finiteNumber(paper.shares, 0)),
     avgPrice: Math.max(0, finiteNumber(paper.avgPrice, 0)),
     positionOpenedAt: Math.max(0, finiteNumber(paper.positionOpenedAt, 0)),
+    stopPrice: Math.max(0, finiteNumber(paper.stopPrice, 0)),
+    targetPrice: Math.max(0, finiteNumber(paper.targetPrice, 0)),
+    entrySetup: typeof paper.entrySetup === "string" ? paper.entrySetup : "",
     realized: finiteNumber(paper.realized, 0),
     orders: Array.isArray(paper.orders) ? paper.orders.slice(0, 80) : [],
     equityHistory: Array.isArray(paper.equityHistory) ? paper.equityHistory.slice(-120) : [],
@@ -1381,9 +1877,10 @@ function normalizePersistedState(value: unknown): PersistedLabState | null {
   if (!value || typeof value !== "object") return null;
   const state = value as Partial<PersistedLabState>;
   const range = state.range;
+  const savedVersion = Math.trunc(finiteNumber(state.version, 1));
   return {
     version: STATE_VERSION,
-    model: normalizeModel(state.model),
+    model: migrateModel(state.model, savedVersion),
     trainingEpoch: Math.max(0, Math.trunc(finiteNumber(state.trainingEpoch, 1840))),
     trainingRuns: Array.isArray(state.trainingRuns) ? state.trainingRuns.slice(0, 40) : [],
     paper: normalizePaper(state.paper),
@@ -1436,7 +1933,8 @@ export default function Home() {
   const latest = filteredData[filteredData.length - 1] ?? MARKET_DATA[MARKET_DATA.length - 1];
   const previous = filteredData[filteredData.length - 2] ?? latest;
   const dayMove = latest.close / previous.close - 1;
-  const latestFactors = scoreBar(latest, model).factors;
+  const latestDecision = useMemo(() => scoreBar(latest, model), [latest, model]);
+  const latestFactors = latestDecision.factors;
   const marketClock = getMarketClock(clock);
   const paperValue = paper.cash + paper.shares * paperPrice;
   const paperPnl = paperValue - PAPER_STARTING_CASH;
@@ -1558,7 +2056,7 @@ export default function Home() {
         const nextPrice = Math.max(1, currentPrice * (1 + wave + noise));
         if (tickRef.current % 2 === 0) {
           const liveScore = clamp(
-            result.scores[result.scores.length - 1] +
+            latestDecision.score +
               Math.sin(tickRef.current / 3.1) * 0.43 +
               Math.sin(tickRef.current / 1.7) * 0.16,
             -1,
@@ -1573,11 +2071,14 @@ export default function Home() {
             }).format(new Date());
             const threshold = intradayEntryThreshold(model);
             const equity = account.cash + account.shares * nextPrice;
-            const quantity = Math.max(1, Math.floor((equity * 0.46) / nextPrice));
+            const stopDistance = Math.max(latest.atr * latestDecision.stopAtr, nextPrice * 0.0026);
+            const riskFraction = latestDecision.regime === "RANGE" ? 0.006 : latestDecision.regime === "SQUEEZE" ? 0.0095 : 0.008;
+            const allocation = equity * (latestDecision.regime === "RANGE" ? 0.58 : 0.76);
+            const quantity = Math.max(1, Math.floor(Math.min(allocation / nextPrice, (equity * riskFraction) / stopDistance)));
             const stamp = Date.now();
             const longReturn = account.shares > 0 && account.avgPrice > 0 ? nextPrice / account.avgPrice - 1 : 0;
             const shortReturn = account.shares < 0 && account.avgPrice > 0 ? account.avgPrice / nextPrice - 1 : 0;
-            const timedExit = account.positionOpenedAt > 0 && stamp - account.positionOpenedAt >= 8_000;
+            const timedExit = account.positionOpenedAt > 0 && stamp - account.positionOpenedAt >= 16_000;
 
             const remember = (next: PaperAccount) => ({
               ...next,
@@ -1597,7 +2098,10 @@ export default function Home() {
                 shares: quantity,
                 avgPrice: nextPrice,
                 positionOpenedAt: stamp,
-                orders: [{ id: `paper-buy-${stamp}`, time, side: "BUY", shares: quantity, price: nextPrice, note: "Policy opened a long" }, ...account.orders],
+                stopPrice: nextPrice - stopDistance,
+                targetPrice: nextPrice + stopDistance * latestDecision.rewardRisk,
+                entrySetup: latestDecision.setup,
+                orders: [{ id: `paper-buy-${stamp}`, time, side: "BUY", shares: quantity, price: nextPrice, note: latestDecision.setup }, ...account.orders],
               });
             }
             if (account.shares === 0 && liveScore < -threshold) {
@@ -1608,35 +2112,66 @@ export default function Home() {
                 shares: -quantity,
                 avgPrice: nextPrice,
                 positionOpenedAt: stamp,
-                orders: [{ id: `paper-short-${stamp}`, time, side: "SHORT", shares: quantity, price: nextPrice, note: "Policy opened a short" }, ...account.orders],
+                stopPrice: nextPrice + stopDistance,
+                targetPrice: nextPrice - stopDistance * latestDecision.rewardRisk,
+                entrySetup: latestDecision.setup,
+                orders: [{ id: `paper-short-${stamp}`, time, side: "SHORT", shares: quantity, price: nextPrice, note: latestDecision.setup }, ...account.orders],
               });
             }
-            if (account.shares > 0 && (liveScore < -0.015 || longReturn >= 0.0065 || longReturn <= -0.0048 || timedExit)) {
+            if (account.shares > 0 && (liveScore < -threshold * 0.72 || (account.targetPrice > 0 && nextPrice >= account.targetPrice) || (account.stopPrice > 0 && nextPrice <= account.stopPrice) || timedExit)) {
               const proceeds = account.shares * nextPrice - 1;
               const realized = (nextPrice - account.avgPrice) * account.shares - 2;
+              const exitNote = account.targetPrice > 0 && nextPrice >= account.targetPrice
+                ? "Risk / reward target"
+                : account.stopPrice > 0 && nextPrice <= account.stopPrice
+                  ? "ATR risk stop"
+                  : timedExit
+                    ? "Time stop"
+                    : "Confluence reversed";
               return remember({
                 ...account,
                 cash: account.cash + proceeds,
                 shares: 0,
                 avgPrice: 0,
                 positionOpenedAt: 0,
+                stopPrice: 0,
+                targetPrice: 0,
+                entrySetup: "",
                 realized: account.realized + realized,
-                orders: [{ id: `paper-sell-${stamp}`, time, side: "SELL", shares: account.shares, price: nextPrice, note: longReturn >= 0.0065 ? "Profit target" : longReturn <= -0.0048 ? "Risk stop" : timedExit ? "Time stop" : "Signal reversed" }, ...account.orders],
+                orders: [{ id: `paper-sell-${stamp}`, time, side: "SELL", shares: account.shares, price: nextPrice, note: exitNote }, ...account.orders],
               });
             }
-            if (account.shares < 0 && (liveScore > 0.015 || shortReturn >= 0.0065 || shortReturn <= -0.0048 || timedExit)) {
+            if (account.shares < 0 && (liveScore > threshold * 0.72 || (account.targetPrice > 0 && nextPrice <= account.targetPrice) || (account.stopPrice > 0 && nextPrice >= account.stopPrice) || timedExit)) {
               const coverShares = Math.abs(account.shares);
               const cost = coverShares * nextPrice + 1;
               const realized = (account.avgPrice - nextPrice) * coverShares - 2;
+              const exitNote = account.targetPrice > 0 && nextPrice <= account.targetPrice
+                ? "Risk / reward target"
+                : account.stopPrice > 0 && nextPrice >= account.stopPrice
+                  ? "ATR risk stop"
+                  : timedExit
+                    ? "Time stop"
+                    : "Confluence reversed";
               return remember({
                 ...account,
                 cash: account.cash - cost,
                 shares: 0,
                 avgPrice: 0,
                 positionOpenedAt: 0,
+                stopPrice: 0,
+                targetPrice: 0,
+                entrySetup: "",
                 realized: account.realized + realized,
-                orders: [{ id: `paper-cover-${stamp}`, time, side: "COVER", shares: coverShares, price: nextPrice, note: shortReturn >= 0.0065 ? "Profit target" : shortReturn <= -0.0048 ? "Risk stop" : timedExit ? "Time stop" : "Signal reversed" }, ...account.orders],
+                orders: [{ id: `paper-cover-${stamp}`, time, side: "COVER", shares: coverShares, price: nextPrice, note: exitNote }, ...account.orders],
               });
+            }
+            if (account.shares > 0) {
+              const protectedStop = longReturn >= riskFraction ? Math.max(account.stopPrice, account.avgPrice * 1.0002) : account.stopPrice;
+              return remember({ ...account, stopPrice: Math.max(protectedStop, nextPrice - latest.atr * 0.78) });
+            }
+            if (account.shares < 0) {
+              const protectedStop = shortReturn >= riskFraction ? Math.min(account.stopPrice, account.avgPrice * 0.9998) : account.stopPrice;
+              return remember({ ...account, stopPrice: Math.min(protectedStop || Number.POSITIVE_INFINITY, nextPrice + latest.atr * 0.78) });
             }
             return remember(account);
           });
@@ -1645,7 +2180,7 @@ export default function Home() {
       });
     }, 1800);
     return () => window.clearInterval(timer);
-  }, [paperActive, replayMode, marketClock.isOpen, model, result.scores]);
+  }, [paperActive, replayMode, marketClock.isOpen, model, latest, latestDecision]);
 
   useEffect(() => {
     if (marketClock.isOpen || replayMode || paper.shares === 0) return;
@@ -1664,6 +2199,9 @@ export default function Home() {
             shares: 0,
             avgPrice: 0,
             positionOpenedAt: 0,
+            stopPrice: 0,
+            targetPrice: 0,
+            entrySetup: "",
             realized: account.realized + realized,
             orders: [{ id: `paper-close-${stamp}`, time, side: "SELL", shares: quantity, price: paperPrice, note: "Closing bell / no overnight risk" }, ...account.orders].slice(0, 80),
           };
@@ -1676,6 +2214,9 @@ export default function Home() {
           shares: 0,
           avgPrice: 0,
           positionOpenedAt: 0,
+          stopPrice: 0,
+          targetPrice: 0,
+          entrySetup: "",
           realized: account.realized + realized,
           orders: [{ id: `paper-cover-close-${stamp}`, time, side: "COVER", shares: quantity, price: paperPrice, note: "Closing bell / no overnight risk" }, ...account.orders].slice(0, 80),
         };
@@ -1693,8 +2234,8 @@ export default function Home() {
       (bar) => bar.date >= draftStart && bar.date <= draftEnd,
     );
     const count = new Set(bars.map((bar) => bar.date)).size;
-    if (count < 10) {
-      setRangeError("Use at least 10 market days so the intraday indicators can warm up.");
+    if (count < 5) {
+      setRangeError("Use at least five market days for a complete trading-week replay.");
       return;
     }
     setRangeError("");
@@ -1734,12 +2275,12 @@ export default function Home() {
       bestObjective = teacherSeedEvaluation.objective;
     }
 
-    const maxEpochs = 90;
+    const maxEpochs = 24;
     let epochsCompleted = 0;
     for (let epoch = 1; epoch <= maxEpochs; epoch += 1) {
       epochsCompleted = epoch;
       const temperature = 0.2 * (1 - epoch / maxEpochs) + 0.018;
-      for (let candidateIndex = 0; candidateIndex < 10; candidateIndex += 1) {
+      for (let candidateIndex = 0; candidateIndex < 4; candidateIndex += 1) {
         const raw = {
           trend: clamp(bestModel.trend + (Math.random() - 0.5) * temperature, 0.03, 0.78),
           rsi: clamp(bestModel.rsi + (Math.random() - 0.5) * temperature, 0.02, 0.52),
@@ -1747,9 +2288,16 @@ export default function Home() {
           volatility: clamp(bestModel.volatility + (Math.random() - 0.5) * temperature, 0.01, 0.34),
           vwap: clamp(bestModel.vwap + (Math.random() - 0.5) * temperature, 0.02, 0.58),
           volume: clamp(bestModel.volume + (Math.random() - 0.5) * temperature, 0.01, 0.38),
-          threshold: clamp(bestModel.threshold + (Math.random() - 0.5) * 0.04, 0.11, 0.34),
+          orb: clamp(bestModel.orb + (Math.random() - 0.5) * temperature, 0.02, 0.62),
+          pullback: clamp(bestModel.pullback + (Math.random() - 0.5) * temperature, 0.02, 0.58),
+          squeeze: clamp(bestModel.squeeze + (Math.random() - 0.5) * temperature, 0.015, 0.48),
+          levels: clamp(bestModel.levels + (Math.random() - 0.5) * temperature, 0.015, 0.44),
+          pattern: clamp(bestModel.pattern + (Math.random() - 0.5) * temperature, 0.015, 0.44),
+          threshold: clamp(bestModel.threshold + (Math.random() - 0.5) * 0.035, 0.18, 0.34),
         };
-        const sum = raw.trend + raw.rsi + raw.momentum + raw.volatility + raw.vwap + raw.volume;
+        const sum =
+          raw.trend + raw.rsi + raw.momentum + raw.volatility + raw.vwap + raw.volume +
+          raw.orb + raw.pullback + raw.squeeze + raw.levels + raw.pattern;
         const candidate: ModelWeights = {
           trend: raw.trend / sum,
           rsi: raw.rsi / sum,
@@ -1757,6 +2305,11 @@ export default function Home() {
           volatility: raw.volatility / sum,
           vwap: raw.vwap / sum,
           volume: raw.volume / sum,
+          orb: raw.orb / sum,
+          pullback: raw.pullback / sum,
+          squeeze: raw.squeeze / sum,
+          levels: raw.levels / sum,
+          pattern: raw.pattern / sum,
           threshold: raw.threshold,
         };
         const candidateEvaluation = evaluateModel(filteredData, candidate);
@@ -1767,7 +2320,7 @@ export default function Home() {
         }
       }
 
-      if (epoch % 5 === 0 || epoch === maxEpochs) {
+      if (epoch % 2 === 0 || epoch === maxEpochs) {
         setTrainingProgress(Math.round((epoch / maxEpochs) * 100));
         setTrainingEpoch(startingEpoch + epoch);
         await new Promise<void>((resolve) => window.setTimeout(resolve, 12));
@@ -1775,7 +2328,7 @@ export default function Home() {
       if (
         bestEvaluation.validationResult.alpha > 0.035 &&
         bestEvaluation.agreement > 0.54 &&
-        epoch > 45
+        epoch > 12
       ) break;
     }
 
@@ -1822,12 +2375,17 @@ export default function Home() {
   };
 
   const factors = [
+    { label: "Opening range", value: latestFactors.orb, weight: model.orb, color: "mint" },
+    { label: "VWAP / EMA pullback", value: latestFactors.pullback, weight: model.pullback, color: "blue" },
+    { label: "Bollinger squeeze", value: latestFactors.squeeze, weight: model.squeeze, color: "violet" },
+    { label: "Key levels", value: latestFactors.levels, weight: model.levels, color: "amber" },
     { label: "EMA trend", value: latestFactors.trend, weight: model.trend, color: "mint" },
     { label: "Momentum", value: latestFactors.momentum, weight: model.momentum, color: "amber" },
     { label: "RSI edge", value: latestFactors.rsi, weight: model.rsi, color: "violet" },
     { label: "VWAP", value: latestFactors.vwap, weight: model.vwap, color: "blue" },
     { label: "Volume", value: latestFactors.volume, weight: model.volume, color: "mint" },
     { label: "Volatility", value: latestFactors.volatility, weight: model.volatility, color: "blue" },
+    { label: "Candle confirmation", value: latestFactors.pattern, weight: model.pattern, color: "violet" },
   ];
 
   return (
@@ -1900,7 +2458,7 @@ export default function Home() {
                   {percent(dayMove, 2)}
                 </span>
               </div>
-              <p>30-minute candles / same-day long and short / flat by 4:00 PM</p>
+              <p>30-minute ensemble / ORB, pullbacks, squeezes, levels / flat by 4:00 PM</p>
             </div>
           </div>
 
@@ -1909,7 +2467,7 @@ export default function Home() {
             <div>
               <span>Policy action</span>
               <strong>{result.signal}</strong>
-              <small>{result.confidence}% confidence</small>
+              <small>{result.confidence}% / {latestDecision.setup}</small>
             </div>
           </div>
 
@@ -1969,9 +2527,9 @@ export default function Home() {
                 <small>{money(result.finalValue)} final value</small>
               </div>
               <div className="outcome-item">
-                <span>Day-trade frequency</span>
-                <strong>{result.tradesPerDay.toFixed(1)} / day</strong>
-                <small>{result.roundTrips} closed positions</small>
+                <span>Average simulated week</span>
+                <strong className={result.averageWeekReturn >= 0 ? "positive" : "negative"}>{percent(result.averageWeekReturn)}</strong>
+                <small>{Math.round(result.positiveWeekRate * 100)}% positive / {result.tradesPerDay.toFixed(1)} trades daily</small>
               </div>
               <div className="outcome-item">
                 <span>Excess return</span>
@@ -1995,7 +2553,7 @@ export default function Home() {
               <div>
                 <span className="view-kicker">INTRADAY BACKTEST</span>
                 <h2>Day-trading replay</h2>
-                <p>Frequent same-day opportunities on 30-minute candles, with no overnight positions.</p>
+                <p>High-conviction same-day setups with ATR risk sizing and no overnight positions.</p>
               </div>
               {backtestTab === "chart" && <div className="timeframe-control" role="group" aria-label="Chart viewport">
                 {(["ALL", "1M", "2W", "5D"] as const).map((item) => (
@@ -2022,6 +2580,7 @@ export default function Home() {
               <span><Activity size={14} /> {sessionCount} days / {filteredData.length} intraday candles</span>
               <span><TrendingUp size={14} /> {result.longEntries} longs</span>
               <span><TrendingDown size={14} /> {result.shortEntries} shorts</span>
+              <span><Target size={14} /> {latestDecision.regime.toLowerCase()} / {latestDecision.confluence} confirmations</span>
               <span><ShieldCheck size={14} /> Fees and slippage included</span>
             </div>
 
@@ -2066,6 +2625,8 @@ export default function Home() {
                 </p>
                 <div className="plain-stats">
                   <div><span>Winning exits</span><strong>{(result.winRate * 100).toFixed(0)}%</strong></div>
+                  <div><span>Positive weeks</span><strong>{(result.positiveWeekRate * 100).toFixed(0)}%</strong></div>
+                  <div><span>Average week</span><strong>{percent(result.averageWeekReturn)}</strong></div>
                   <div><span>Trades per day</span><strong>{result.tradesPerDay.toFixed(1)}</strong></div>
                   <div><span>Average hold</span><strong>{Math.round(result.averageHoldBars * 30)}m</strong></div>
                   <div><span>Closed positions</span><strong>{result.roundTrips}</strong></div>
@@ -2161,8 +2722,8 @@ export default function Home() {
                   {trainingTab === "policy" &&
                   <article className="model-explanation">
                     <span className="view-kicker">CAUSAL POLICY</span>
-                    <h3>Six inputs, no future leakage</h3>
-                    <p>The teacher can see future prices, but the saved policy can only use indicators available on that candle.</p>
+                    <h3>Eleven signals, one regime-aware decision</h3>
+                    <p>ORB, VWAP / EMA pullbacks, squeezes, levels, candles, trend, momentum, RSI, ADX, volatility, and volume use only information available at that candle.</p>
                     <div className="refined-factor-list">
                       {factors.map((factor) => {
                         const contribution = factor.value * factor.weight;
@@ -2187,7 +2748,7 @@ export default function Home() {
                     <div>
                       <span className="view-kicker">HINDSIGHT TEACHER</span>
                       <h3>Shows the best direction after the fact</h3>
-                      <p>For each training candle, the teacher labels the next four intraday candles as long, short, or flat. Those future-aware labels guide learning only.</p>
+                      <p>For each training candle, the teacher compares the best long and short excursion over the next five candles. Those future-aware labels guide training only.</p>
                     </div>
                     <div className="teacher-score">
                       <span>Policy agreement</span>
@@ -2284,7 +2845,7 @@ export default function Home() {
                   <span className={marketClock.isOpen ? "paper-market-icon open" : "paper-market-icon"}><Clock3 size={18} /></span>
                   <div>
                     <strong>{marketClock.isOpen ? "Market session is open" : marketClock.label}</strong>
-                    <p>{paperActive ? (marketClock.isOpen ? "The saved policy is checking each simulated tick for a long, short, or exit." : replayMode ? "A demo session is replaying now." : "The bot will wake automatically at the opening bell.") : "Start the bot and it will wait safely for the next open."}</p>
+                    <p>{paperActive ? (marketClock.isOpen ? "The ensemble is checking ORB, trend, pullback, squeeze, level, candle, volume, and risk signals." : replayMode ? "A compressed demo session is replaying the same policy now." : "The bot will wake automatically at the opening bell.") : "Start the bot and it will wait safely for the next open."}</p>
                   </div>
                 </div>
 
@@ -2302,8 +2863,8 @@ export default function Home() {
                 </div>
                 <div className="automation-rules">
                   <div><span>Decision interval</span><strong>Every simulated 30m candle</strong></div>
-                  <div><span>Position policy</span><strong>Long / short / flat</strong></div>
-                  <div><span>Risk exits</span><strong>Target, stop, 2-candle time exit</strong></div>
+                  <div><span>Position policy</span><strong>2–5 confirmations / long or short</strong></div>
+                  <div><span>Risk exits</span><strong>ATR stop / 1.35–2.35R target</strong></div>
                   <div><span>Overnight risk</span><strong>Always flat by 4:00 PM</strong></div>
                 </div>
                 </div>}
@@ -2340,7 +2901,7 @@ export default function Home() {
 
         <footer className="app-footer refined-footer">
           <div><ShieldCheck size={14} /> Research sandbox only. No real orders or guaranteed returns.</div>
-          <span>Deterministic AAPL tape / account-saved checkpoints and portfolio</span>
+          <span>Synthetic regime tape—not historical AAPL returns / saved checkpoints and portfolio</span>
         </footer>
       </div>
 

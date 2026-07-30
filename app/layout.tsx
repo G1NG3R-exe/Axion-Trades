@@ -25,7 +25,7 @@ export async function generateMetadata(): Promise<Metadata> {
   const origin = `${protocol}://${host}`;
   const title = "Signal Forge - Persistent Trading Research Lab";
   const description =
-    "A persistent AAPL intraday research lab with frequent same-day long and short backtests, teacher-guided training, and a saved paper portfolio.";
+    "A persistent AAPL intraday research lab with a regime-aware ORB, VWAP, EMA, Bollinger, momentum, volume, and key-level strategy ensemble.";
 
   return {
     title,
