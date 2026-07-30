@@ -1,6 +1,17 @@
 import type { Metadata } from "next";
+import { Geist, Geist_Mono } from "next/font/google";
 import { headers } from "next/headers";
 import "./globals.css";
+
+const geistSans = Geist({
+  variable: "--font-geist-sans",
+  subsets: ["latin"],
+});
+
+const geistMono = Geist_Mono({
+  variable: "--font-geist-mono",
+  subsets: ["latin"],
+});
 
 export async function generateMetadata(): Promise<Metadata> {
   const requestHeaders = await headers();
@@ -12,34 +23,30 @@ export async function generateMetadata(): Promise<Metadata> {
     requestHeaders.get("x-forwarded-proto") ??
     (host.includes("localhost") ? "http" : "https");
   const origin = `${protocol}://${host}`;
-  const title = "Axion Trades";
+  const title = "Signal Forge — AI Trading Research Lab";
   const description =
-    "A persistent AAPL intraday research lab with a regime-aware ORB, VWAP, EMA, Bollinger, momentum, volume, and key-level strategy ensemble.";
+    "An interactive AAPL backtesting and paper-trading dashboard with AI signals, candlesticks, indicators, and transparent execution logs.";
 
   return {
     title,
     description,
     metadataBase: new URL(origin),
     icons: {
-      icon: [
-        { url: "/favicon.png", type: "image/png", sizes: "64x64" },
-        { url: "/favicon.ico", sizes: "any" },
-      ],
-      shortcut: "/favicon.png",
-      apple: [{ url: "/apple-touch-icon.png", sizes: "180x180", type: "image/png" }],
+      icon: "/favicon.svg",
+      shortcut: "/favicon.svg",
     },
     openGraph: {
       title,
       description,
       type: "website",
       url: origin,
-      images: [{ url: `${origin}/og-liquid.png`, alt: "axion-trades liquid-glass market research artwork" }],
+      images: [{ url: `${origin}/og.png`, alt: "Signal Forge AI trading research dashboard" }],
     },
     twitter: {
       card: "summary_large_image",
       title,
       description,
-      images: [`${origin}/og-liquid.png`],
+      images: [`${origin}/og.png`],
     },
   };
 }
@@ -50,8 +57,12 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" data-theme="light">
-      <body className="antialiased">{children}</body>
+    <html lang="en">
+      <body
+        className={`${geistSans.variable} ${geistMono.variable} antialiased`}
+      >
+        {children}
+      </body>
     </html>
   );
 }
