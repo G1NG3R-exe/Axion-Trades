@@ -5,28 +5,34 @@ import {
   ArrowDownRight,
   ArrowUpRight,
   BarChart3,
-  Bot,
+  BookOpenCheck,
   BrainCircuit,
+  BriefcaseBusiness,
   CalendarRange,
   Check,
-  CircleDollarSign,
+  Cloud,
+  CloudOff,
   Clock3,
   Cpu,
   Database,
   Gauge,
+  GraduationCap,
+  History,
   Info,
   Layers3,
+  Moon,
   Pause,
   Play,
   Radio,
   RefreshCw,
   RotateCcw,
+  Save,
   ShieldCheck,
-  Sparkles,
+  Sun,
   Target,
+  Trophy,
   TrendingDown,
   TrendingUp,
-  WalletCards,
   Zap,
 } from "lucide-react";
 import {
@@ -61,10 +67,12 @@ type ModelWeights = {
   threshold: number;
 };
 
+type Position = "LONG" | "SHORT" | "FLAT";
+
 type Trade = {
   id: string;
   date: string;
-  side: "BUY" | "SELL";
+  side: "BUY" | "SELL" | "SHORT" | "COVER";
   price: number;
   shares: number;
   value: number;
@@ -85,14 +93,16 @@ type BacktestResult = {
   equity: number[];
   buyHoldEquity: number[];
   scores: number[];
-  signal: "BUY" | "HOLD" | "SELL";
+  signal: "BUY" | "HOLD" | "SHORT";
   confidence: number;
+  longEntries: number;
+  shortEntries: number;
 };
 
 type PaperOrder = {
   id: string;
   time: string;
-  side: "BUY" | "SELL";
+  side: "BUY" | "SELL" | "SHORT" | "COVER";
   shares: number;
   price: number;
   note: string;
@@ -104,6 +114,29 @@ type PaperAccount = {
   avgPrice: number;
   realized: number;
   orders: PaperOrder[];
+  equityHistory: Array<{ time: string; value: number }>;
+};
+
+type TrainingRun = {
+  id: string;
+  completedAt: string;
+  range: { start: string; end: string };
+  epochs: number;
+  improved: boolean;
+  validationReturn: number;
+  validationAlpha: number;
+  validationDrawdown: number;
+  teacherAgreement: number;
+  objectiveDelta: number;
+};
+
+type PersistedLabState = {
+  version: 2;
+  model: ModelWeights;
+  trainingEpoch: number;
+  trainingRuns: TrainingRun[];
+  paper: PaperAccount;
+  range: { start: string; end: string };
 };
 
 const STARTING_CAPITAL = 10_000;
@@ -112,6 +145,7 @@ const DATA_START = "2020-01-02";
 const DATA_END = "2026-07-29";
 const DEFAULT_START = "2024-01-02";
 const DEFAULT_END = "2025-12-31";
+const STATE_VERSION = 2;
 
 const INITIAL_MODEL: ModelWeights = {
   trend: 0.49,
@@ -119,6 +153,15 @@ const INITIAL_MODEL: ModelWeights = {
   momentum: 0.24,
   volatility: 0.09,
   threshold: 0.24,
+};
+
+const INITIAL_PAPER: PaperAccount = {
+  cash: PAPER_STARTING_CASH,
+  shares: 0,
+  avgPrice: 0,
+  realized: 0,
+  orders: [],
+  equityHistory: [],
 };
 
 const clamp = (value: number, min: number, max: number) =>
@@ -292,6 +335,8 @@ function runBacktest(
       scores: [0],
       signal: "HOLD",
       confidence: 50,
+      longEntries: 0,
+      shortEntries: 0,
     };
   }
 
@@ -309,12 +354,17 @@ function runBacktest(
   let previousEquity = startingCapital;
   let wins = 0;
   let exits = 0;
+  let longEntries = 0;
+  let shortEntries = 0;
 
   data.forEach((bar, index) => {
     const { score } = scoreBar(bar, weights);
     scores.push(score);
     const confidence = Math.round(50 + Math.min(0.49, Math.abs(score)) * 100);
     const canTrade = index > 22;
+    const fee = 1;
+    const longReturn = shares > 0 && entryPrice > 0 ? bar.close / entryPrice - 1 : 0;
+    const shortReturn = shares < 0 && entryPrice > 0 ? entryPrice / bar.close - 1 : 0;
 
     if (
       canTrade &&
@@ -324,12 +374,13 @@ function runBacktest(
       bar.rsi < 76
     ) {
       const fill = bar.close * 1.0006;
-      const quantity = Math.floor((cash * 0.97 - 1) / fill);
+      const quantity = Math.floor((cash * 0.92 - fee) / fill);
       if (quantity > 0) {
-        const cost = quantity * fill + 1;
+        const cost = quantity * fill + fee;
         cash -= cost;
         shares = quantity;
         entryPrice = fill;
+        longEntries += 1;
         trades.push({
           id: `buy-${bar.date}-${index}`,
           date: bar.date,
@@ -344,14 +395,42 @@ function runBacktest(
       }
     } else if (
       canTrade &&
-      shares > 0 &&
-      (score < -weights.threshold * 0.52 ||
-        (bar.ema9 < bar.ema21 && bar.rsi > 42) ||
-        bar.rsi > 78)
+      shares === 0 &&
+      score < -weights.threshold &&
+      bar.ema9 < bar.ema21 &&
+      bar.rsi > 24
     ) {
       const fill = bar.close * 0.9994;
-      const proceeds = shares * fill - 1;
-      const pnl = (fill - entryPrice) * shares - 2;
+      const quantity = Math.floor((cash * 0.72 - fee) / fill);
+      if (quantity > 0) {
+        const proceeds = quantity * fill - fee;
+        cash += proceeds;
+        shares = -quantity;
+        entryPrice = fill;
+        shortEntries += 1;
+        trades.push({
+          id: `short-${bar.date}-${index}`,
+          date: bar.date,
+          side: "SHORT",
+          price: fill,
+          shares: quantity,
+          value: proceeds,
+          pnl: null,
+          confidence,
+          reason: bar.rsi > 62 ? "Hindsight-taught reversal" : "Bearish trend break",
+        });
+      }
+    } else if (
+      canTrade &&
+      shares > 0 &&
+      (score < weights.threshold * 0.05 ||
+        (bar.ema9 < bar.ema21 && score < 0) ||
+        bar.rsi > 79 ||
+        longReturn < -0.09)
+    ) {
+      const fill = bar.close * 0.9994;
+      const proceeds = shares * fill - fee;
+      const pnl = (fill - entryPrice) * shares - fee * 2;
       cash += proceeds;
       exits += 1;
       if (pnl > 0) wins += 1;
@@ -364,12 +443,41 @@ function runBacktest(
         value: proceeds,
         pnl,
         confidence,
-        reason: bar.rsi > 78 ? "Overbought guardrail" : "Risk-off signal",
+        reason: longReturn < -0.09 ? "Long stop-loss" : bar.rsi > 79 ? "Overbought guardrail" : "Close long",
+      });
+      shares = 0;
+      entryPrice = 0;
+    } else if (
+      canTrade &&
+      shares < 0 &&
+      (score > -weights.threshold * 0.05 ||
+        (bar.ema9 > bar.ema21 && score > 0) ||
+        bar.rsi < 22 ||
+        shortReturn < -0.09)
+    ) {
+      const quantity = Math.abs(shares);
+      const fill = bar.close * 1.0006;
+      const cost = quantity * fill + fee;
+      const pnl = (entryPrice - fill) * quantity - fee * 2;
+      cash -= cost;
+      exits += 1;
+      if (pnl > 0) wins += 1;
+      trades.push({
+        id: `cover-${bar.date}-${index}`,
+        date: bar.date,
+        side: "COVER",
+        price: fill,
+        shares: quantity,
+        value: cost,
+        pnl,
+        confidence,
+        reason: shortReturn < -0.09 ? "Short stop-loss" : bar.rsi < 22 ? "Oversold guardrail" : "Cover short",
       });
       shares = 0;
       entryPrice = 0;
     }
 
+    if (shares < 0) cash -= Math.abs(shares) * bar.close * 0.00003;
     const portfolioValue = cash + shares * bar.close;
     equity.push(portfolioValue);
     peak = Math.max(peak, portfolioValue);
@@ -392,8 +500,8 @@ function runBacktest(
   const signal =
     latestScore > weights.threshold
       ? "BUY"
-      : latestScore < -weights.threshold * 0.52
-        ? "SELL"
+      : latestScore < -weights.threshold
+        ? "SHORT"
         : "HOLD";
 
   return {
@@ -410,7 +518,96 @@ function runBacktest(
     scores,
     signal,
     confidence: Math.round(50 + Math.min(0.49, Math.abs(latestScore)) * 100),
+    longEntries,
+    shortEntries,
   };
+}
+
+function oracleAction(data: MarketBar[], index: number): Position {
+  const futureIndex = Math.min(data.length - 1, index + 4);
+  if (futureIndex <= index) return "FLAT";
+  const futureReturn = data[futureIndex].close / data[index].close - 1;
+  if (futureReturn > 0.006) return "LONG";
+  if (futureReturn < -0.006) return "SHORT";
+  return "FLAT";
+}
+
+function policyAction(bar: MarketBar, weights: ModelWeights): Position {
+  const score = scoreBar(bar, weights).score;
+  if (score > weights.threshold) return "LONG";
+  if (score < -weights.threshold) return "SHORT";
+  return "FLAT";
+}
+
+function teacherAgreement(data: MarketBar[], weights: ModelWeights) {
+  if (data.length < 30) return 0;
+  let matched = 0;
+  let total = 0;
+  for (let index = 22; index < data.length - 4; index += 1) {
+    const teacher = oracleAction(data, index);
+    const policy = policyAction(data[index], weights);
+    matched += teacher === policy ? 1 : 0;
+    total += 1;
+  }
+  return total === 0 ? 0 : matched / total;
+}
+
+function splitForTraining(data: MarketBar[]) {
+  const splitIndex = Math.max(70, Math.floor(data.length * 0.72));
+  return {
+    trainingData: data.slice(0, Math.min(splitIndex, data.length - 30)),
+    validationData: data.slice(Math.max(0, Math.min(splitIndex, data.length - 30) - 22)),
+  };
+}
+
+function evaluateModel(data: MarketBar[], weights: ModelWeights) {
+  const { trainingData, validationData } = splitForTraining(data);
+  const trainingResult = runBacktest(trainingData, weights);
+  const validationResult = runBacktest(validationData, weights);
+  const agreement = teacherAgreement(trainingData, weights);
+  const turnoverPenalty = Math.max(0, trainingResult.trades.length / Math.max(1, trainingData.length) - 0.16);
+  const objective =
+    validationResult.strategyReturn * 0.52 +
+    validationResult.alpha * 0.38 +
+    validationResult.sharpe * 0.018 -
+    Math.abs(validationResult.maxDrawdown) * 0.32 +
+    trainingResult.strategyReturn * 0.12 +
+    agreement * 0.12 -
+    turnoverPenalty * 0.08;
+
+  return { objective, agreement, trainingResult, validationResult };
+}
+
+function teacherSeedModel(data: MarketBar[], current: ModelWeights): ModelWeights {
+  const totals = { trend: 0, rsi: 0, momentum: 0, volatility: 0 };
+  let examples = 0;
+  for (let index = 22; index < data.length - 4; index += 1) {
+    const teacher = oracleAction(data, index);
+    const target = teacher === "LONG" ? 1 : teacher === "SHORT" ? -1 : 0;
+    const factors = scoreBar(data[index], current).factors;
+    totals.trend += factors.trend * target;
+    totals.rsi += factors.rsi * target;
+    totals.momentum += factors.momentum * target;
+    totals.volatility += factors.volatility * target;
+    examples += 1;
+  }
+
+  if (examples === 0) return current;
+  const learned = {
+    trend: Math.max(0.02, totals.trend / examples),
+    rsi: Math.max(0.02, totals.rsi / examples),
+    momentum: Math.max(0.02, totals.momentum / examples),
+    volatility: Math.max(0.01, totals.volatility / examples),
+  };
+  const sum = learned.trend + learned.rsi + learned.momentum + learned.volatility;
+  const blend = 0.34;
+  return normalizeModel({
+    trend: current.trend * (1 - blend) + (learned.trend / sum) * blend,
+    rsi: current.rsi * (1 - blend) + (learned.rsi / sum) * blend,
+    momentum: current.momentum * (1 - blend) + (learned.momentum / sum) * blend,
+    volatility: current.volatility * (1 - blend) + (learned.volatility / sum) * blend,
+    threshold: current.threshold * 0.8 + 0.22 * 0.2,
+  });
 }
 
 function dateLabel(date: string) {
@@ -461,10 +658,12 @@ function MarketChart({
   data,
   result,
   viewport,
+  theme,
 }: {
   data: MarketBar[];
   result: BacktestResult;
   viewport: "ALL" | "1Y" | "6M" | "3M";
+  theme: "light" | "dark";
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const frameRef = useRef<HTMLDivElement | null>(null);
@@ -508,6 +707,11 @@ function MarketChart({
     if (!context) return;
     context.setTransform(ratio, 0, 0, ratio, 0, 0);
     context.clearRect(0, 0, width, height);
+    const isLight = theme === "light";
+    const gridColor = isLight ? "rgba(22, 35, 31, 0.09)" : "rgba(255,255,255,0.07)";
+    const softGridColor = isLight ? "rgba(22, 35, 31, 0.07)" : "rgba(255,255,255,0.06)";
+    const axisColor = isLight ? "rgba(41, 57, 52, 0.60)" : "rgba(198,205,213,0.65)";
+    const mutedAxisColor = isLight ? "rgba(41, 57, 52, 0.48)" : "rgba(198,205,213,0.48)";
 
     const left = 12;
     const right = 64;
@@ -540,13 +744,13 @@ function MarketChart({
     context.lineWidth = 1;
     for (let line = 0; line <= 4; line += 1) {
       const y = priceTop + ((priceBottom - priceTop) / 4) * line;
-      context.strokeStyle = "rgba(255,255,255,0.07)";
+      context.strokeStyle = gridColor;
       context.beginPath();
       context.moveTo(left, y + 0.5);
       context.lineTo(width - right + 6, y + 0.5);
       context.stroke();
       const value = priceMax - ((priceMax - priceMin) / 4) * line;
-      context.fillStyle = "rgba(198,205,213,0.65)";
+      context.fillStyle = axisColor;
       context.textAlign = "left";
       context.fillText(`$${value.toFixed(value > 100 ? 0 : 1)}`, width - right + 12, y + 4);
     }
@@ -629,11 +833,12 @@ function MarketChart({
       visible.forEach((bar, index) => {
         const trade = tradeByDate.get(bar.date);
         if (!trade) return;
+        const isBuyAction = trade.side === "BUY" || trade.side === "COVER";
         const markerY =
-          trade.side === "BUY" ? yPrice(bar.low) + 12 : yPrice(bar.high) - 12;
-        context.fillStyle = trade.side === "BUY" ? "#62d6b6" : "#f17875";
+          isBuyAction ? yPrice(bar.low) + 12 : yPrice(bar.high) - 12;
+        context.fillStyle = isBuyAction ? "#35b993" : "#e3605c";
         context.beginPath();
-        if (trade.side === "BUY") {
+        if (isBuyAction) {
           context.moveTo(x(index), markerY - 7);
           context.lineTo(x(index) - 5, markerY + 2);
           context.lineTo(x(index) + 5, markerY + 2);
@@ -647,7 +852,7 @@ function MarketChart({
       });
     }
 
-    context.strokeStyle = "rgba(255,255,255,0.08)";
+    context.strokeStyle = gridColor;
     context.beginPath();
     context.moveTo(left, oscTop);
     context.lineTo(width - right + 6, oscTop);
@@ -656,13 +861,13 @@ function MarketChart({
     [30, 50, 70].forEach((value) => {
       const y = yRsi(value);
       context.setLineDash(value === 50 ? [2, 5] : [4, 5]);
-      context.strokeStyle = value === 50 ? "rgba(255,255,255,0.06)" : "rgba(240,198,107,0.13)";
+      context.strokeStyle = value === 50 ? softGridColor : "rgba(209,155,43,0.20)";
       context.beginPath();
       context.moveTo(left, y);
       context.lineTo(width - right + 6, y);
       context.stroke();
       context.setLineDash([]);
-      context.fillStyle = "rgba(198,205,213,0.48)";
+      context.fillStyle = mutedAxisColor;
       context.textAlign = "left";
       context.fillText(String(value), width - right + 12, y + 4);
     });
@@ -697,7 +902,7 @@ function MarketChart({
         day: "numeric",
         timeZone: "UTC",
       }).format(date);
-      context.fillStyle = "rgba(198,205,213,0.48)";
+      context.fillStyle = mutedAxisColor;
       context.textAlign = label === 0 ? "left" : label === labelCount - 1 ? "right" : "center";
       context.fillText(text, x(index), height - 7);
     }
@@ -705,18 +910,18 @@ function MarketChart({
     if (hovered !== null && visible[hovered]) {
       const crossX = x(hovered);
       context.setLineDash([3, 4]);
-      context.strokeStyle = "rgba(255,255,255,0.23)";
+      context.strokeStyle = isLight ? "rgba(22,35,31,0.30)" : "rgba(255,255,255,0.23)";
       context.beginPath();
       context.moveTo(crossX, priceTop);
       context.lineTo(crossX, oscBottom);
       context.stroke();
       context.setLineDash([]);
-      context.fillStyle = "#dfe5e1";
+      context.fillStyle = isLight ? "#24332e" : "#dfe5e1";
       context.beginPath();
       context.arc(crossX, yPrice(visible[hovered].close), 3, 0, Math.PI * 2);
       context.fill();
     }
-  }, [visible, visibleScores, layers, hovered, revision, tradeByDate]);
+  }, [visible, visibleScores, layers, hovered, revision, tradeByDate, theme]);
 
   const pointerMove = (event: React.PointerEvent<HTMLCanvasElement>) => {
     if (!canvasRef.current || visible.length < 2) return;
@@ -763,16 +968,16 @@ function MarketChart({
           onClick={() => toggleLayer("trades")}
           type="button"
         >
-          <span className="trade-dots"><i /><i /></span> AI trades
+          <span className="trade-dots"><i /><i /></span> Policy trades
         </button>
-        <span className="legend-chip static"><span className="legend-swatch score" /> AI score</span>
+        <span className="legend-chip static"><span className="legend-swatch score" /> Policy score</span>
       </div>
       <div className="chart-frame" ref={frameRef}>
         <canvas
           ref={canvasRef}
           onPointerMove={pointerMove}
           onPointerLeave={() => setHovered(null)}
-          aria-label="AAPL candlestick chart with EMA, Bollinger Bands, RSI, AI score, volume, and trade markers"
+          aria-label="AAPL candlestick chart with EMA, Bollinger Bands, RSI, policy score, volume, and trade markers"
           role="img"
         />
         {hoverBar && (
@@ -781,7 +986,7 @@ function MarketChart({
           >
             <div className="tooltip-date">
               <span>{dateLabel(hoverBar.date)}</span>
-              {hoverTrade && <b className={hoverTrade.side === "BUY" ? "buy" : "sell"}>{hoverTrade.side}</b>}
+              {hoverTrade && <b className={hoverTrade.side === "BUY" || hoverTrade.side === "COVER" ? "buy" : "sell"}>{hoverTrade.side}</b>}
             </div>
             <div className="tooltip-values">
               <span>O <b>{hoverBar.open.toFixed(2)}</b></span>
@@ -801,7 +1006,7 @@ function MarketChart({
   );
 }
 
-function EquityChart({ result }: { result: BacktestResult }) {
+function EquityChart({ result, theme }: { result: BacktestResult; theme: "light" | "dark" }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const [revision, setRevision] = useState(0);
@@ -858,9 +1063,9 @@ function EquityChart({ result }: { result: BacktestResult }) {
         context.fill();
       }
     };
-    drawLine(result.buyHoldEquity, "rgba(169,156,246,0.46)");
-    drawLine(result.equity, "#62d6b6", true);
-  }, [result, revision]);
+    drawLine(result.buyHoldEquity, theme === "light" ? "rgba(104,87,190,0.55)" : "rgba(169,156,246,0.46)");
+    drawLine(result.equity, theme === "light" ? "#168b70" : "#62d6b6", true);
+  }, [result, revision, theme]);
 
   return (
     <div className="equity-canvas" ref={wrapRef}>
@@ -869,30 +1074,61 @@ function EquityChart({ result }: { result: BacktestResult }) {
   );
 }
 
-function MetricCard({
-  label,
-  value,
-  detail,
-  tone = "neutral",
-  icon,
-}: {
-  label: string;
-  value: string;
-  detail: string;
-  tone?: "positive" | "negative" | "neutral";
-  icon: React.ReactNode;
-}) {
+function PortfolioChart({ history, theme }: { history: PaperAccount["equityHistory"]; theme: "light" | "dark" }) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const wrapRef = useRef<HTMLDivElement | null>(null);
+  const [revision, setRevision] = useState(0);
+
+  useEffect(() => {
+    if (!wrapRef.current) return;
+    const observer = new ResizeObserver(() => setRevision((value) => value + 1));
+    observer.observe(wrapRef.current);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const wrap = wrapRef.current;
+    if (!canvas || !wrap) return;
+    const width = Math.max(220, wrap.clientWidth);
+    const height = Math.max(86, wrap.clientHeight);
+    const ratio = window.devicePixelRatio || 1;
+    canvas.width = width * ratio;
+    canvas.height = height * ratio;
+    canvas.style.width = `${width}px`;
+    canvas.style.height = `${height}px`;
+    const context = canvas.getContext("2d");
+    if (!context) return;
+    context.setTransform(ratio, 0, 0, ratio, 0, 0);
+    context.clearRect(0, 0, width, height);
+    const values = history.length > 1 ? history.map((point) => point.value) : [PAPER_STARTING_CASH, PAPER_STARTING_CASH];
+    const min = Math.min(...values) * 0.998;
+    const max = Math.max(...values) * 1.002;
+    const spread = Math.max(1, max - min);
+    const x = (index: number) => 2 + (index / Math.max(1, values.length - 1)) * (width - 4);
+    const y = (value: number) => 8 + ((max - value) / spread) * (height - 16);
+    context.beginPath();
+    values.forEach((value, index) => index === 0 ? context.moveTo(x(index), y(value)) : context.lineTo(x(index), y(value)));
+    context.strokeStyle = theme === "light" ? "#168b70" : "#62d6b6";
+    context.lineWidth = 2;
+    context.stroke();
+    context.lineTo(width - 2, height);
+    context.lineTo(2, height);
+    context.closePath();
+    const gradient = context.createLinearGradient(0, 0, 0, height);
+    gradient.addColorStop(0, theme === "light" ? "rgba(22,139,112,0.18)" : "rgba(98,214,182,0.18)");
+    gradient.addColorStop(1, "rgba(98,214,182,0)");
+    context.fillStyle = gradient;
+    context.fill();
+  }, [history, revision, theme]);
+
   return (
-    <article className="metric-card">
-      <div className="metric-heading">
-        <span>{label}</span>
-        <span className="metric-icon">{icon}</span>
-      </div>
-      <div className={`metric-value ${tone}`}>{value}</div>
-      <p>{detail}</p>
-    </article>
+    <div className="portfolio-canvas" ref={wrapRef}>
+      <canvas ref={canvasRef} aria-label="Paper portfolio value history" role="img" />
+    </div>
   );
 }
+
 
 function TrainingSkeleton({
   progress,
@@ -903,12 +1139,12 @@ function TrainingSkeleton({
 }) {
   const phase =
     progress < 24
-      ? "Reading market regimes"
+      ? "Studying the hindsight teacher"
       : progress < 52
-        ? "Testing indicator weights"
+        ? "Searching causal policies"
         : progress < 78
-          ? "Measuring risk and drawdown"
-          : "Selecting the best checkpoint";
+          ? "Testing on the unseen window"
+          : "Saving the best checkpoint";
 
   return (
     <div className="training-live" role="status" aria-live="polite">
@@ -917,7 +1153,7 @@ function TrainingSkeleton({
         <div>
           <span>Live training</span>
           <h2>{phase}</h2>
-          <p>The model is replaying this date range and keeping changes that improve the score.</p>
+          <p>Teacher guidance shapes the search, but the checkpoint is accepted only if it holds up out of sample.</p>
         </div>
         <strong>{progress}%</strong>
       </div>
@@ -948,37 +1184,92 @@ function TrainingSkeleton({
   );
 }
 
+function finiteNumber(value: unknown, fallback: number) {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function normalizeModel(value: unknown): ModelWeights {
+  const model = (value ?? {}) as Partial<ModelWeights>;
+  const raw = {
+    trend: clamp(finiteNumber(model.trend, INITIAL_MODEL.trend), 0.02, 0.85),
+    rsi: clamp(finiteNumber(model.rsi, INITIAL_MODEL.rsi), 0.02, 0.65),
+    momentum: clamp(finiteNumber(model.momentum, INITIAL_MODEL.momentum), 0.02, 0.72),
+    volatility: clamp(finiteNumber(model.volatility, INITIAL_MODEL.volatility), 0.01, 0.5),
+  };
+  const sum = raw.trend + raw.rsi + raw.momentum + raw.volatility;
+  return {
+    trend: raw.trend / sum,
+    rsi: raw.rsi / sum,
+    momentum: raw.momentum / sum,
+    volatility: raw.volatility / sum,
+    threshold: clamp(finiteNumber(model.threshold, INITIAL_MODEL.threshold), 0.1, 0.5),
+  };
+}
+
+function normalizePaper(value: unknown): PaperAccount {
+  const paper = (value ?? {}) as Partial<PaperAccount>;
+  return {
+    cash: finiteNumber(paper.cash, PAPER_STARTING_CASH),
+    shares: Math.trunc(finiteNumber(paper.shares, 0)),
+    avgPrice: Math.max(0, finiteNumber(paper.avgPrice, 0)),
+    realized: finiteNumber(paper.realized, 0),
+    orders: Array.isArray(paper.orders) ? paper.orders.slice(0, 80) : [],
+    equityHistory: Array.isArray(paper.equityHistory) ? paper.equityHistory.slice(-120) : [],
+  };
+}
+
+function normalizePersistedState(value: unknown): PersistedLabState | null {
+  if (!value || typeof value !== "object") return null;
+  const state = value as Partial<PersistedLabState>;
+  const range = state.range;
+  return {
+    version: STATE_VERSION,
+    model: normalizeModel(state.model),
+    trainingEpoch: Math.max(0, Math.trunc(finiteNumber(state.trainingEpoch, 1840))),
+    trainingRuns: Array.isArray(state.trainingRuns) ? state.trainingRuns.slice(0, 40) : [],
+    paper: normalizePaper(state.paper),
+    range:
+      range && typeof range.start === "string" && typeof range.end === "string"
+        ? range
+        : { start: DEFAULT_START, end: DEFAULT_END },
+  };
+}
+
 export default function Home() {
   const [draftStart, setDraftStart] = useState(DEFAULT_START);
   const [draftEnd, setDraftEnd] = useState(DEFAULT_END);
   const [range, setRange] = useState({ start: DEFAULT_START, end: DEFAULT_END });
   const [viewport, setViewport] = useState<"ALL" | "1Y" | "6M" | "3M">("6M");
   const [activeView, setActiveView] = useState<"chart" | "train" | "paper">("chart");
+  const [theme, setTheme] = useState<"light" | "dark">("dark");
+  const [themeReady, setThemeReady] = useState(false);
   const [model, setModel] = useState(INITIAL_MODEL);
   const [isRunning, setIsRunning] = useState(false);
   const [rangeError, setRangeError] = useState("");
   const [training, setTraining] = useState(false);
   const [trainingProgress, setTrainingProgress] = useState(100);
   const [trainingEpoch, setTrainingEpoch] = useState(1840);
+  const [trainingRuns, setTrainingRuns] = useState<TrainingRun[]>([]);
+  const [syncStatus, setSyncStatus] = useState<"loading" | "saving" | "saved" | "offline">("loading");
+  const [hydrated, setHydrated] = useState(false);
   const [clock, setClock] = useState<Date | null>(null);
   const [paperActive, setPaperActive] = useState(false);
   const [replayMode, setReplayMode] = useState(false);
   const [paperPrice, setPaperPrice] = useState(MARKET_DATA[MARKET_DATA.length - 1].close);
-  const [paper, setPaper] = useState<PaperAccount>({
-    cash: PAPER_STARTING_CASH,
-    shares: 0,
-    avgPrice: 0,
-    realized: 0,
-    orders: [],
-  });
+  const [paper, setPaper] = useState<PaperAccount>({ ...INITIAL_PAPER });
   const [toast, setToast] = useState("");
   const tickRef = useRef(0);
+  const saveTimerRef = useRef<number | null>(null);
 
   const filteredData = useMemo(
     () => MARKET_DATA.filter((bar) => bar.date >= range.start && bar.date <= range.end),
     [range],
   );
   const result = useMemo(() => runBacktest(filteredData, model), [filteredData, model]);
+  const trainingEvaluation = useMemo(
+    () => (filteredData.length >= 100 ? evaluateModel(filteredData, model) : null),
+    [filteredData, model],
+  );
   const latest = filteredData[filteredData.length - 1] ?? MARKET_DATA[MARKET_DATA.length - 1];
   const previous = filteredData[filteredData.length - 2] ?? latest;
   const dayMove = latest.close / previous.close - 1;
@@ -986,24 +1277,107 @@ export default function Home() {
   const marketClock = getMarketClock(clock);
   const paperValue = paper.cash + paper.shares * paperPrice;
   const paperPnl = paperValue - PAPER_STARTING_CASH;
+  const paperPosition: Position = paper.shares > 0 ? "LONG" : paper.shares < 0 ? "SHORT" : "FLAT";
+  const paperUnrealized =
+    paper.shares > 0
+      ? (paperPrice - paper.avgPrice) * paper.shares
+      : paper.shares < 0
+        ? (paper.avgPrice - paperPrice) * Math.abs(paper.shares)
+        : 0;
+  const validationResult = trainingEvaluation?.validationResult ?? result;
+  const currentTeacherAgreement = trainingEvaluation?.agreement ?? 0;
+  const trainingSplitCount = Math.max(0, Math.min(Math.max(70, Math.floor(filteredData.length * 0.72)), filteredData.length - 30));
 
   useEffect(() => {
-    setClock(new Date());
+    const immediate = window.setTimeout(() => setClock(new Date()), 0);
     const timer = window.setInterval(() => setClock(new Date()), 1000);
-    const saved = window.localStorage.getItem("signal-forge-paper-account");
-    if (saved) {
-      try {
-        setPaper(JSON.parse(saved) as PaperAccount);
-      } catch {
-        window.localStorage.removeItem("signal-forge-paper-account");
-      }
-    }
-    return () => window.clearInterval(timer);
+    return () => {
+      window.clearTimeout(immediate);
+      window.clearInterval(timer);
+    };
   }, []);
 
   useEffect(() => {
-    window.localStorage.setItem("signal-forge-paper-account", JSON.stringify(paper));
-  }, [paper]);
+    const timer = window.setTimeout(() => {
+      const savedTheme = window.localStorage.getItem("signal-forge-theme");
+      const nextTheme =
+        savedTheme === "light" || savedTheme === "dark"
+          ? savedTheme
+          : window.matchMedia("(prefers-color-scheme: light)").matches
+            ? "light"
+            : "dark";
+      setTheme(nextTheme);
+      setThemeReady(true);
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, []);
+
+  useEffect(() => {
+    if (!themeReady) return;
+    document.documentElement.dataset.theme = theme;
+    window.localStorage.setItem("signal-forge-theme", theme);
+  }, [theme, themeReady]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadPersistentState = async () => {
+      setSyncStatus("loading");
+      try {
+        const response = await fetch("/api/state", { cache: "no-store" });
+        if (!response.ok) throw new Error("State load failed");
+        const body = (await response.json()) as { state?: unknown };
+        const saved = normalizePersistedState(body.state);
+        if (!cancelled && saved) {
+          setModel(saved.model);
+          setTrainingEpoch(saved.trainingEpoch);
+          setTrainingRuns(saved.trainingRuns);
+          setPaper(saved.paper);
+          setRange(saved.range);
+          setDraftStart(saved.range.start);
+          setDraftEnd(saved.range.end);
+        }
+        if (!cancelled) setSyncStatus("saved");
+      } catch {
+        if (!cancelled) setSyncStatus("offline");
+      } finally {
+        if (!cancelled) setHydrated(true);
+      }
+    };
+    void loadPersistentState();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!hydrated) return;
+    if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = window.setTimeout(async () => {
+      setSyncStatus("saving");
+      const state: PersistedLabState = {
+        version: STATE_VERSION,
+        model,
+        trainingEpoch,
+        trainingRuns: trainingRuns.slice(0, 40),
+        paper,
+        range,
+      };
+      try {
+        const response = await fetch("/api/state", {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ state }),
+        });
+        if (!response.ok) throw new Error("State save failed");
+        setSyncStatus("saved");
+      } catch {
+        setSyncStatus("offline");
+      }
+    }, 700);
+    return () => {
+      if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
+    };
+  }, [hydrated, model, paper, range, trainingEpoch, trainingRuns]);
 
   useEffect(() => {
     if (!toast) return;
@@ -1032,58 +1406,74 @@ export default function Home() {
               second: "2-digit",
               timeZone: "America/New_York",
             }).format(new Date());
-            if (account.shares === 0 && liveScore > 0.38) {
-              const shares = Math.max(1, Math.floor(Math.min(12, (account.cash * 0.22) / nextPrice)));
-              const cost = shares * nextPrice + 1;
-              if (cost > account.cash) return account;
-              return {
+            const threshold = Math.max(0.28, model.threshold);
+            const equity = account.cash + account.shares * nextPrice;
+            const quantity = Math.max(1, Math.floor(Math.min(28, (equity * 0.22) / nextPrice)));
+            const stamp = Date.now();
+
+            const remember = (next: PaperAccount) => ({
+              ...next,
+              orders: next.orders.slice(0, 80),
+              equityHistory: [
+                ...next.equityHistory,
+                { time: new Date().toISOString(), value: next.cash + next.shares * nextPrice },
+              ].slice(-120),
+            });
+
+            if (account.shares === 0 && liveScore > threshold) {
+              const cost = quantity * nextPrice + 1;
+              if (cost > account.cash) return remember(account);
+              return remember({
                 ...account,
                 cash: account.cash - cost,
-                shares,
+                shares: quantity,
                 avgPrice: nextPrice,
-                orders: [
-                  {
-                    id: `paper-buy-${Date.now()}`,
-                    time,
-                    side: "BUY",
-                    shares,
-                    price: nextPrice,
-                    note: liveScore > 0.62 ? "High-conviction trend" : "Signal crossover",
-                  },
-                  ...account.orders,
-                ].slice(0, 8),
-              };
+                orders: [{ id: `paper-buy-${stamp}`, time, side: "BUY", shares: quantity, price: nextPrice, note: "Policy opened a long" }, ...account.orders],
+              });
             }
-            if (account.shares > 0 && liveScore < -0.3) {
+            if (account.shares === 0 && liveScore < -threshold) {
+              const proceeds = quantity * nextPrice - 1;
+              return remember({
+                ...account,
+                cash: account.cash + proceeds,
+                shares: -quantity,
+                avgPrice: nextPrice,
+                orders: [{ id: `paper-short-${stamp}`, time, side: "SHORT", shares: quantity, price: nextPrice, note: "Policy opened a short" }, ...account.orders],
+              });
+            }
+            if (account.shares > 0 && liveScore < 0.04) {
               const proceeds = account.shares * nextPrice - 1;
               const realized = (nextPrice - account.avgPrice) * account.shares - 2;
-              return {
+              return remember({
                 ...account,
                 cash: account.cash + proceeds,
                 shares: 0,
                 avgPrice: 0,
                 realized: account.realized + realized,
-                orders: [
-                  {
-                    id: `paper-sell-${Date.now()}`,
-                    time,
-                    side: "SELL",
-                    shares: account.shares,
-                    price: nextPrice,
-                    note: "Risk-off threshold",
-                  },
-                  ...account.orders,
-                ].slice(0, 8),
-              };
+                orders: [{ id: `paper-sell-${stamp}`, time, side: "SELL", shares: account.shares, price: nextPrice, note: "Policy closed the long" }, ...account.orders],
+              });
             }
-            return account;
+            if (account.shares < 0 && liveScore > -0.04) {
+              const coverShares = Math.abs(account.shares);
+              const cost = coverShares * nextPrice + 1;
+              const realized = (account.avgPrice - nextPrice) * coverShares - 2;
+              return remember({
+                ...account,
+                cash: account.cash - cost,
+                shares: 0,
+                avgPrice: 0,
+                realized: account.realized + realized,
+                orders: [{ id: `paper-cover-${stamp}`, time, side: "COVER", shares: coverShares, price: nextPrice, note: "Policy covered the short" }, ...account.orders],
+              });
+            }
+            return remember(account);
           });
         }
         return nextPrice;
       });
     }, 1800);
     return () => window.clearInterval(timer);
-  }, [paperActive, replayMode, marketClock.isOpen, result.scores]);
+  }, [paperActive, replayMode, marketClock.isOpen, model.threshold, result.scores]);
 
   const applyRange = () => {
     if (!draftStart || !draftEnd || draftStart >= draftEnd) {
@@ -1107,26 +1497,45 @@ export default function Home() {
     }, 520);
   };
 
+
   const trainModel = useCallback(async () => {
-    if (training || filteredData.length < 35) return;
+    if (training) return;
+    if (filteredData.length < 100) {
+      setToast("Training needs at least 100 market sessions for a holdout window");
+      return;
+    }
+
     setActiveView("train");
     setTraining(true);
     setTrainingProgress(0);
     const trainingStartedAt = Date.now();
+    const startingEpoch = trainingEpoch;
+    const { trainingData } = splitForTraining(filteredData);
     let bestModel = { ...model };
-    let bestResult = runBacktest(filteredData, bestModel);
-    let bestObjective = bestResult.strategyReturn - Math.abs(bestResult.maxDrawdown) * 0.22;
-    const maxEpochs = 110;
+    const baseline = evaluateModel(filteredData, bestModel);
+    let bestEvaluation = baseline;
+    let bestObjective = baseline.objective;
 
+    const teacherSeed = teacherSeedModel(trainingData, model);
+    const teacherSeedEvaluation = evaluateModel(filteredData, teacherSeed);
+    if (teacherSeedEvaluation.objective > bestObjective) {
+      bestModel = teacherSeed;
+      bestEvaluation = teacherSeedEvaluation;
+      bestObjective = teacherSeedEvaluation.objective;
+    }
+
+    const maxEpochs = 140;
+    let epochsCompleted = 0;
     for (let epoch = 1; epoch <= maxEpochs; epoch += 1) {
-      const temperature = 0.18 * (1 - epoch / maxEpochs) + 0.025;
-      for (let candidateIndex = 0; candidateIndex < 9; candidateIndex += 1) {
+      epochsCompleted = epoch;
+      const temperature = 0.2 * (1 - epoch / maxEpochs) + 0.018;
+      for (let candidateIndex = 0; candidateIndex < 12; candidateIndex += 1) {
         const raw = {
           trend: clamp(bestModel.trend + (Math.random() - 0.5) * temperature, 0.03, 0.78),
           rsi: clamp(bestModel.rsi + (Math.random() - 0.5) * temperature, 0.02, 0.52),
           momentum: clamp(bestModel.momentum + (Math.random() - 0.5) * temperature, 0.02, 0.62),
           volatility: clamp(bestModel.volatility + (Math.random() - 0.5) * temperature, 0.01, 0.34),
-          threshold: clamp(bestModel.threshold + (Math.random() - 0.5) * 0.06, 0.12, 0.46),
+          threshold: clamp(bestModel.threshold + (Math.random() - 0.5) * 0.055, 0.11, 0.46),
         };
         const sum = raw.trend + raw.rsi + raw.momentum + raw.volatility;
         const candidate: ModelWeights = {
@@ -1136,43 +1545,62 @@ export default function Home() {
           volatility: raw.volatility / sum,
           threshold: raw.threshold,
         };
-        const candidateResult = runBacktest(filteredData, candidate);
-        const objective =
-          candidateResult.strategyReturn -
-          Math.abs(candidateResult.maxDrawdown) * 0.22 +
-          candidateResult.alpha * 0.18;
-        if (objective > bestObjective) {
-          bestObjective = objective;
+        const candidateEvaluation = evaluateModel(filteredData, candidate);
+        if (candidateEvaluation.objective > bestObjective) {
+          bestObjective = candidateEvaluation.objective;
           bestModel = candidate;
-          bestResult = candidateResult;
+          bestEvaluation = candidateEvaluation;
         }
       }
-      if (epoch % 4 === 0 || epoch === maxEpochs) {
+
+      if (epoch % 5 === 0 || epoch === maxEpochs) {
         setTrainingProgress(Math.round((epoch / maxEpochs) * 100));
-        setTrainingEpoch((current) => current + 4);
+        setTrainingEpoch(startingEpoch + epoch);
         await new Promise<void>((resolve) => window.setTimeout(resolve, 12));
       }
-      if (bestResult.alpha > 0.035 && epoch > 28) break;
+      if (
+        bestEvaluation.validationResult.alpha > 0.035 &&
+        bestEvaluation.agreement > 0.54 &&
+        epoch > 45
+      ) break;
     }
 
-    const minimumLiveState = 1600;
+    setTrainingProgress(96);
+    const minimumLiveState = 1800;
     const remainingLiveTime = minimumLiveState - (Date.now() - trainingStartedAt);
     if (remainingLiveTime > 0) {
       await new Promise<void>((resolve) => window.setTimeout(resolve, remainingLiveTime));
     }
 
-    setModel(bestModel);
+    const improved = bestObjective > baseline.objective + 0.000001;
+    if (improved) setModel(bestModel);
+    setTrainingEpoch(startingEpoch + epochsCompleted);
+    setTrainingRuns((current) => [
+      {
+        id: `run-${Date.now()}`,
+        completedAt: new Date().toISOString(),
+        range: { ...range },
+        epochs: epochsCompleted,
+        improved,
+        validationReturn: bestEvaluation.validationResult.strategyReturn,
+        validationAlpha: bestEvaluation.validationResult.alpha,
+        validationDrawdown: bestEvaluation.validationResult.maxDrawdown,
+        teacherAgreement: bestEvaluation.agreement,
+        objectiveDelta: Math.max(0, bestObjective - baseline.objective),
+      },
+      ...current,
+    ].slice(0, 40));
     setTrainingProgress(100);
     setTraining(false);
     setToast(
-      bestResult.alpha > 0
-        ? `Training target reached · ${percent(bestResult.alpha)} alpha`
-        : "Training complete · target not reached on this window",
+      improved
+        ? `Checkpoint saved / ${percent(bestEvaluation.validationResult.alpha)} holdout alpha`
+        : "Training complete / current checkpoint remains stronger",
     );
-  }, [filteredData, model, training]);
+  }, [filteredData, model, range, training, trainingEpoch]);
 
   const resetPaper = () => {
-    setPaper({ cash: PAPER_STARTING_CASH, shares: 0, avgPrice: 0, realized: 0, orders: [] });
+    setPaper({ ...INITIAL_PAPER, orders: [], equityHistory: [] });
     setPaperPrice(MARKET_DATA[MARKET_DATA.length - 1].close);
     setPaperActive(false);
     setReplayMode(false);
@@ -1190,23 +1618,36 @@ export default function Home() {
     <main className="app-shell refined-shell">
       <header className="topbar refined-topbar">
         <a className="brand" href="#workspace" aria-label="Signal Forge home">
-          <span className="brand-mark"><Sparkles size={17} strokeWidth={2.1} /></span>
+          <span className="brand-mark"><Activity size={17} strokeWidth={2.1} /></span>
           <span>Signal <b>Forge</b></span>
-          <em>LAB</em>
+          <em>SIM</em>
         </a>
 
         <div className="top-actions">
+          <div className={`sync-pill ${syncStatus}`} title="Cloud checkpoint status">
+            {syncStatus === "offline" ? <CloudOff size={14} /> : syncStatus === "saving" ? <Save size={14} /> : <Cloud size={14} />}
+            <span>{syncStatus === "loading" ? "Loading" : syncStatus === "saving" ? "Saving" : syncStatus === "offline" ? "Offline" : "Saved"}</span>
+          </div>
           <div className="market-status refined-market-status">
             <span className={marketClock.isOpen ? "status-dot live" : "status-dot"} />
             <span><b>{marketClock.label}</b><small>{marketClock.time}</small></span>
           </div>
           <button
+            className="theme-toggle"
+            type="button"
+            onClick={() => setTheme((current) => current === "dark" ? "light" : "dark")}
+            aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
+            title={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
+          >
+            {theme === "dark" ? <Sun size={16} /> : <Moon size={16} />}
+          </button>
+          <button
             className="paper-account-shortcut"
             type="button"
             onClick={() => setActiveView("paper")}
           >
-            <WalletCards size={15} />
-            Paper {money(paperValue)}
+            <BriefcaseBusiness size={15} />
+            {money(paperValue)}
           </button>
           <div className="avatar" aria-label="Paper trading account">AS</div>
         </div>
@@ -1229,14 +1670,14 @@ export default function Home() {
                   {percent(dayMove, 2)}
                 </span>
               </div>
-              <p>Daily candles / Forge PPO v18 / trained on one stock</p>
+              <p>Daily candles / Forge Policy v2 / long, short, or stay flat</p>
             </div>
           </div>
 
           <div className={"hero-signal " + result.signal.toLowerCase()}>
             <span className="hero-signal-icon"><BrainCircuit size={20} /></span>
             <div>
-              <span>AI signal</span>
+              <span>Policy action</span>
               <strong>{result.signal}</strong>
               <small>{result.confidence}% confidence</small>
             </div>
@@ -1245,7 +1686,7 @@ export default function Home() {
           <div className="range-builder">
             <div className="range-builder-title">
               <span><CalendarRange size={17} /></span>
-              <div><strong>Test the strategy</strong><small>Choose a historical window</small></div>
+              <div><strong>Replay history</strong><small>Choose a clean test window</small></div>
             </div>
             <div className="range-fields">
               <label htmlFor="start-date">
@@ -1293,17 +1734,17 @@ export default function Home() {
           ) : (
             <>
               <div className="outcome-item primary">
-                <span>Strategy earned</span>
+                <span>Policy return</span>
                 <strong>{percent(result.strategyReturn)}</strong>
                 <small>{money(result.finalValue)} final value</small>
               </div>
               <div className="outcome-item">
-                <span>If you just held</span>
+                <span>Buy and hold</span>
                 <strong>{percent(result.buyHoldReturn)}</strong>
                 <small>Same stock, same dates</small>
               </div>
               <div className="outcome-item">
-                <span>Strategy difference</span>
+                <span>Excess return</span>
                 <strong className={result.alpha >= 0 ? "positive" : "negative"}>{percent(result.alpha)}</strong>
                 <small>{result.alpha >= 0 ? "Ahead of buy & hold" : "Behind buy & hold"}</small>
               </div>
@@ -1327,7 +1768,7 @@ export default function Home() {
             onClick={() => setActiveView("chart")}
           >
             <BarChart3 size={17} />
-            <span><strong>Chart</strong><small>Price, indicators & trades</small></span>
+            <span><strong>Overview</strong><small>Chart, decisions, results</small></span>
           </button>
           <button
             id="tab-train"
@@ -1339,7 +1780,7 @@ export default function Home() {
             onClick={() => setActiveView("train")}
           >
             <BrainCircuit size={17} />
-            <span><strong>Train AI</strong><small>Weights & learning progress</small></span>
+            <span><strong>Training</strong><small>Teacher, holdout, checkpoints</small></span>
             {training && <i className="tab-live-dot" />}
           </button>
           <button
@@ -1351,8 +1792,8 @@ export default function Home() {
             type="button"
             onClick={() => setActiveView("paper")}
           >
-            <WalletCards size={17} />
-            <span><strong>Paper trade</strong><small>Fake money, market hours</small></span>
+            <BriefcaseBusiness size={17} />
+            <span><strong>Portfolio</strong><small>Positions, P&amp;L, orders</small></span>
             {paperActive && <i className="tab-live-dot" />}
           </button>
         </nav>
@@ -1362,8 +1803,8 @@ export default function Home() {
             <div className="workspace-heading">
               <div>
                 <span className="view-kicker">BACKTEST REPLAY</span>
-                <h2>See what the model saw</h2>
-                <p>Every indicator and AI trade is aligned to the same price timeline.</p>
+                <h2>One timeline, every decision</h2>
+                <p>Price, causal inputs, long and short entries, and exits stay aligned.</p>
               </div>
               <div className="timeframe-control" role="group" aria-label="Chart viewport">
                 {(["ALL", "1Y", "6M", "3M"] as const).map((item) => (
@@ -1381,7 +1822,8 @@ export default function Home() {
 
             <div className="chart-summary-line">
               <span><Activity size={14} /> {filteredData.length} market sessions</span>
-              <span><ArrowUpRight size={14} /> {result.trades.length} executed orders</span>
+              <span><TrendingUp size={14} /> {result.longEntries} longs</span>
+              <span><TrendingDown size={14} /> {result.shortEntries} shorts</span>
               <span><ShieldCheck size={14} /> Fees and slippage included</span>
             </div>
 
@@ -1392,16 +1834,16 @@ export default function Home() {
                 <span>Replaying {draftStart} through {draftEnd}...</span>
               </div>
             ) : (
-              <MarketChart data={filteredData} result={result} viewport={viewport} />
+              <MarketChart data={filteredData} result={result} viewport={viewport} theme={theme} />
             )}
 
             <div className="chart-help">
               <div>
                 <Info size={16} />
-                <p><strong>How to read this:</strong> green and red triangles are the AI&apos;s buys and sells. The colored lines are the exact signals used to make each decision.</p>
+                <p><strong>How to read this:</strong> green markers are buys or covers; red markers are sells or short entries. The policy never sees future candles.</p>
               </div>
               <button className="text-button" type="button" onClick={() => setActiveView("train")}>
-                See how the AI decides <ArrowUpRight size={14} />
+                See how the policy learns <ArrowUpRight size={14} />
               </button>
             </div>
 
@@ -1412,7 +1854,7 @@ export default function Home() {
                   <span className={result.alpha >= 0 ? "alpha-badge positive" : "alpha-badge negative"}>{percent(result.alpha)} vs hold</span>
                 </div>
                 <div className="equity-legend"><span><i className="strategy" /> Strategy</span><span><i className="hold" /> Buy & hold</span></div>
-                <EquityChart result={result} />
+                <EquityChart result={result} theme={theme} />
               </article>
 
               <article className="plain-summary">
@@ -1425,7 +1867,7 @@ export default function Home() {
                 </p>
                 <div className="plain-stats">
                   <div><span>Winning exits</span><strong>{(result.winRate * 100).toFixed(0)}%</strong></div>
-                  <div><span>Round trips</span><strong>{Math.floor(result.trades.length / 2)}</strong></div>
+                  <div><span>Closed positions</span><strong>{Math.floor(result.trades.length / 2)}</strong></div>
                   <div><span>Risk score</span><strong>{result.sharpe.toFixed(2)}</strong></div>
                 </div>
               </article>
@@ -1433,7 +1875,7 @@ export default function Home() {
 
             <details className="trade-drawer">
               <summary>
-                <span><Layers3 size={16} /> Recent AI trades</span>
+                <span><Layers3 size={16} /> Recent policy trades</span>
                 <small>{result.trades.length} orders in this backtest</small>
               </summary>
               <div className="table-wrap refined-table">
@@ -1443,7 +1885,7 @@ export default function Home() {
                     {result.trades.slice().reverse().slice(0, 10).map((trade) => (
                       <tr key={trade.id}>
                         <td>{dateLabel(trade.date)}</td>
-                        <td><span className={trade.side === "BUY" ? "side-tag buy" : "side-tag sell"}>{trade.side}</span></td>
+                        <td><span className={trade.side === "BUY" || trade.side === "COVER" ? "side-tag buy" : "side-tag sell"}>{trade.side}</span></td>
                         <td>{money(trade.price, 2)}</td>
                         <td>{trade.shares}</td>
                         <td className={trade.pnl === null ? "muted-cell" : trade.pnl >= 0 ? "positive-cell" : "negative-cell"}>{trade.pnl === null ? "Entry" : money(trade.pnl)}</td>
@@ -1466,13 +1908,13 @@ export default function Home() {
               <>
                 <div className="workspace-heading">
                   <div>
-                    <span className="view-kicker">MODEL TRAINING</span>
-                    <h2>Teach the AI on this date range</h2>
-                    <p>It tests new indicator weights and keeps the strongest risk-adjusted checkpoint.</p>
+                    <span className="view-kicker">LEARNING LOOP</span>
+                    <h2>Teacher-guided, judged out of sample</h2>
+                    <p>The first 72% teaches the policy. The final 28% decides whether a checkpoint is worth saving.</p>
                   </div>
-                  <span className={result.alpha > 0 ? "training-status success" : "training-status"}>
-                    {result.alpha > 0 ? <Check size={14} /> : <Target size={14} />}
-                    {result.alpha > 0 ? "Goal reached" : "Needs improvement"}
+                  <span className={validationResult.alpha > 0 ? "training-status success" : "training-status"}>
+                    {validationResult.alpha > 0 ? <Check size={14} /> : <Target size={14} />}
+                    {validationResult.alpha > 0 ? "Holdout ahead" : "Searching"}
                   </span>
                 </div>
 
@@ -1482,37 +1924,37 @@ export default function Home() {
                       <div className="training-model-mark"><Cpu size={22} /></div>
                       <div>
                         <span>Current checkpoint</span>
-                        <h3>Forge PPO / epoch {trainingEpoch}</h3>
-                        <p>Objective: finish above buy & hold without taking excessive risk.</p>
+                        <h3>Forge Policy v2 / epoch {trainingEpoch}</h3>
+                        <p>Saved across sessions. A weaker run can never replace it.</p>
                       </div>
                     </div>
 
                     <div className="comparison-block">
-                      <div className="comparison-label"><span>Strategy</span><strong>{percent(result.strategyReturn)}</strong></div>
-                      <div className="comparison-track strategy"><i style={{ width: Math.round(clamp(Math.max(0, result.strategyReturn) / Math.max(0.1, result.strategyReturn, result.buyHoldReturn) * 100, 6, 100)) + "%" }} /></div>
-                      <div className="comparison-label"><span>Buy & hold</span><strong>{percent(result.buyHoldReturn)}</strong></div>
-                      <div className="comparison-track hold"><i style={{ width: Math.round(clamp(Math.max(0, result.buyHoldReturn) / Math.max(0.1, result.strategyReturn, result.buyHoldReturn) * 100, 6, 100)) + "%" }} /></div>
+                      <div className="comparison-label"><span>Holdout policy</span><strong>{percent(validationResult.strategyReturn)}</strong></div>
+                      <div className="comparison-track strategy"><i style={{ width: Math.round(clamp(Math.max(0, validationResult.strategyReturn) / Math.max(0.1, validationResult.strategyReturn, validationResult.buyHoldReturn) * 100, 6, 100)) + "%" }} /></div>
+                      <div className="comparison-label"><span>Holdout buy &amp; hold</span><strong>{percent(validationResult.buyHoldReturn)}</strong></div>
+                      <div className="comparison-track hold"><i style={{ width: Math.round(clamp(Math.max(0, validationResult.buyHoldReturn) / Math.max(0.1, validationResult.strategyReturn, validationResult.buyHoldReturn) * 100, 6, 100)) + "%" }} /></div>
                     </div>
 
                     <div className="training-objective-card">
                       <div>
                         <span>Distance from goal</span>
-                        <strong className={result.alpha >= 0 ? "positive" : "negative"}>{percent(result.alpha)}</strong>
+                        <strong className={validationResult.alpha >= 0 ? "positive" : "negative"}>{percent(validationResult.alpha)}</strong>
                       </div>
-                      <p>{result.alpha >= 0 ? "This checkpoint already clears the benchmark." : "Retraining will search nearby policies for a better result."}</p>
+                      <p>{validationResult.alpha >= 0 ? "This checkpoint clears the benchmark on data it did not train on." : "Training will search nearby policies and keep the current one unless validation improves."}</p>
                     </div>
 
                     <button className="primary-button train-cta" type="button" onClick={trainModel}>
                       <Zap size={16} />
-                      Start live training
+                      Train another checkpoint
                     </button>
-                    <small className="safe-note"><ShieldCheck size={13} /> Training only changes this simulation. It cannot place real orders.</small>
+                    <small className="safe-note"><ShieldCheck size={13} /> Hindsight labels are training-only. They are never available to the paper bot.</small>
                   </article>
 
                   <article className="model-explanation">
-                    <span className="view-kicker">WHAT THE AI USES</span>
-                    <h3>Four signals shape every decision</h3>
-                    <p>Longer bars have more influence. The score shows whether each signal currently pushes toward buying or selling.</p>
+                    <span className="view-kicker">CAUSAL POLICY</span>
+                    <h3>Four inputs, no future leakage</h3>
+                    <p>The teacher can see future prices, but the saved policy can only use indicators available on that candle.</p>
                     <div className="refined-factor-list">
                       {factors.map((factor) => {
                         const contribution = factor.value * factor.weight;
@@ -1531,10 +1973,58 @@ export default function Home() {
                   </article>
                 </div>
 
+                <div className="learning-grid">
+                  <article className="teacher-card">
+                    <div className="teacher-card-icon"><GraduationCap size={21} /></div>
+                    <div>
+                      <span className="view-kicker">HINDSIGHT TEACHER</span>
+                      <h3>Shows the best direction after the fact</h3>
+                      <p>For each training candle, the teacher labels the next four sessions as long, short, or flat. Those future-aware labels guide learning only.</p>
+                    </div>
+                    <div className="teacher-score">
+                      <span>Policy agreement</span>
+                      <strong>{(currentTeacherAgreement * 100).toFixed(0)}%</strong>
+                    </div>
+                  </article>
+
+                  <article className="split-card">
+                    <div className="split-card-heading">
+                      <div><BookOpenCheck size={17} /><span>Walk-forward split</span></div>
+                      <small>{filteredData.length} sessions</small>
+                    </div>
+                    <div className="split-rail" aria-label="Training and holdout split">
+                      <span style={{ width: `${filteredData.length ? trainingSplitCount / filteredData.length * 100 : 72}%` }}>Teacher training</span>
+                      <span>Unseen holdout</span>
+                    </div>
+                    <p>The model studies the earlier period. The later period stays hidden until scoring, which reduces backtest overfitting.</p>
+                  </article>
+                </div>
+
+                <section className="training-history" aria-label="Saved training history">
+                  <div className="training-history-heading">
+                    <div><History size={17} /><span><strong>Checkpoint history</strong><small>Persisted to your account</small></span></div>
+                    <span>{trainingRuns.filter((run) => run.improved).length} saved</span>
+                  </div>
+                  {trainingRuns.length === 0 ? (
+                    <div className="training-history-empty">Run training once to create the first durable checkpoint record.</div>
+                  ) : (
+                    <div className="training-run-list">
+                      {trainingRuns.slice(0, 4).map((run) => (
+                        <div className="training-run" key={run.id}>
+                          <span className={run.improved ? "run-icon saved" : "run-icon"}>{run.improved ? <Trophy size={14} /> : <ShieldCheck size={14} />}</span>
+                          <div><strong>{run.improved ? "Checkpoint saved" : "Checkpoint kept"}</strong><small>{new Date(run.completedAt).toLocaleString()} / {run.epochs} epochs</small></div>
+                          <div><span>Holdout</span><strong className={run.validationAlpha >= 0 ? "positive" : "negative"}>{percent(run.validationAlpha)}</strong></div>
+                          <div><span>Teacher</span><strong>{(run.teacherAgreement * 100).toFixed(0)}%</strong></div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </section>
+
                 <div className="checkpoint-strip">
-                  <div><Gauge size={17} /><span><small>Confidence</small><strong>{result.confidence}%</strong></span></div>
-                  <div><ShieldCheck size={17} /><span><small>Max drawdown</small><strong>{percent(result.maxDrawdown)}</strong></span></div>
-                  <div><Target size={17} /><span><small>Win rate</small><strong>{(result.winRate * 100).toFixed(0)}%</strong></span></div>
+                  <div><Gauge size={17} /><span><small>Policy confidence</small><strong>{result.confidence}%</strong></span></div>
+                  <div><ShieldCheck size={17} /><span><small>Holdout drawdown</small><strong>{percent(validationResult.maxDrawdown)}</strong></span></div>
+                  <div><Target size={17} /><span><small>Teacher agreement</small><strong>{(currentTeacherAgreement * 100).toFixed(0)}%</strong></span></div>
                   <button className="text-button" type="button" onClick={() => setActiveView("chart")}>View result on chart <ArrowUpRight size={14} /></button>
                 </div>
               </>
@@ -1546,9 +2036,9 @@ export default function Home() {
           <section className="panel focused-workspace paper-workspace" id="panel-paper" role="tabpanel" aria-labelledby="tab-paper">
             <div className="workspace-heading">
               <div>
-                <span className="view-kicker">PAPER TRADING</span>
-                <h2>Let the model practice with fake money</h2>
-                <p>The bot follows New York market hours and never connects to a brokerage.</p>
+                <span className="view-kicker">PORTFOLIO SIMULATOR</span>
+                <h2>Practice long and short with fake money</h2>
+                <p>Cash, positions, P&amp;L, and every order are saved to your account.</p>
               </div>
               <span className={paperActive ? "bot-state armed" : "bot-state"}><Radio size={12} /> {paperActive ? (marketClock.isOpen || replayMode ? "Running" : "Armed for open") : "Stopped"}</span>
             </div>
@@ -1556,21 +2046,27 @@ export default function Home() {
             <div className="paper-layout">
               <article className="paper-account-card">
                 <div className="paper-account-top">
-                  <div><span>Paper account value</span><strong>{money(paperValue, 2)}</strong></div>
+                  <div><span>Net liquidation value</span><strong>{money(paperValue, 2)}</strong><small className={`position-pill ${paperPosition.toLowerCase()}`}>{paperPosition}</small></div>
                   <div className={paperPnl >= 0 ? "paper-pnl positive" : "paper-pnl negative"}><span>Total result</span><strong>{percent(paperPnl / PAPER_STARTING_CASH, 2)}</strong><small>{money(paperPnl, 2)}</small></div>
                 </div>
 
                 <div className="paper-stats refined-paper-stats">
                   <div><span>Available cash</span><strong>{money(paper.cash, 2)}</strong></div>
-                  <div><span>AAPL held</span><strong>{paper.shares} shares</strong></div>
+                  <div><span>AAPL position</span><strong>{Math.abs(paper.shares)} shares</strong></div>
+                  <div><span>Unrealized P&amp;L</span><strong className={paperUnrealized >= 0 ? "positive" : "negative"}>{money(paperUnrealized, 2)}</strong></div>
                   <div><span>Practice price</span><strong>{money(paperPrice, 2)}</strong></div>
+                </div>
+
+                <div className="portfolio-performance">
+                  <div><span>Portfolio history</span><small>{paper.equityHistory.length ? `${paper.equityHistory.length} saved marks` : "Starts when the bot runs"}</small></div>
+                  <PortfolioChart history={paper.equityHistory} theme={theme} />
                 </div>
 
                 <div className="paper-market-card">
                   <span className={marketClock.isOpen ? "paper-market-icon open" : "paper-market-icon"}><Clock3 size={18} /></span>
                   <div>
                     <strong>{marketClock.isOpen ? "Market session is open" : marketClock.label}</strong>
-                    <p>{paperActive ? (marketClock.isOpen ? "The model is checking every simulated tick for a trade." : replayMode ? "A demo session is replaying now." : "The bot will wake automatically at the opening bell.") : "Start the bot and it will wait safely for the next open."}</p>
+                    <p>{paperActive ? (marketClock.isOpen ? "The saved policy is checking each simulated tick for a long, short, or exit." : replayMode ? "A demo session is replaying now." : "The bot will wake automatically at the opening bell.") : "Start the bot and it will wait safely for the next open."}</p>
                   </div>
                 </div>
 
@@ -1596,21 +2092,21 @@ export default function Home() {
                 <div className="paper-order-list">
                   {paper.orders.length === 0 ? (
                     <div className="empty-paper-orders">
-                      <Bot size={24} />
-                      <strong>No paper trades yet</strong>
-                      <p>Start the bot or replay a session to watch decisions appear here.</p>
+                      <BriefcaseBusiness size={24} />
+                      <strong>No portfolio activity yet</strong>
+                      <p>Start the simulator or replay a session to watch durable orders appear here.</p>
                     </div>
                   ) : (
                     paper.orders.slice(0, 6).map((order) => (
                       <div className="paper-order" key={order.id}>
-                        <span className={order.side === "BUY" ? "order-icon buy" : "order-icon sell"}>{order.side === "BUY" ? <ArrowUpRight size={15} /> : <ArrowDownRight size={15} />}</span>
+                        <span className={order.side === "BUY" || order.side === "COVER" ? "order-icon buy" : "order-icon sell"}>{order.side === "BUY" || order.side === "COVER" ? <ArrowUpRight size={15} /> : <ArrowDownRight size={15} />}</span>
                         <div><strong>{order.side} {order.shares} AAPL</strong><small>{order.note} / {order.time}</small></div>
                         <span>{money(order.price, 2)}</span>
                       </div>
                     ))
                   )}
                 </div>
-                <div className="paper-disclosure"><Info size={14} /> Prices and fills are simulated for learning; this is not live market data.</div>
+                <div className="paper-disclosure"><Database size={14} /> Portfolio and order history are saved. Prices and fills remain simulated.</div>
               </aside>
             </div>
           </section>
@@ -1618,7 +2114,7 @@ export default function Home() {
 
         <footer className="app-footer refined-footer">
           <div><ShieldCheck size={14} /> Research sandbox only. No real orders or guaranteed returns.</div>
-          <span>Deterministic AAPL training tape / local paper account</span>
+          <span>Deterministic AAPL tape / account-saved checkpoints and portfolio</span>
         </footer>
       </div>
 

@@ -23,9 +23,9 @@ export async function generateMetadata(): Promise<Metadata> {
     requestHeaders.get("x-forwarded-proto") ??
     (host.includes("localhost") ? "http" : "https");
   const origin = `${protocol}://${host}`;
-  const title = "Signal Forge — AI Trading Research Lab";
+  const title = "Signal Forge - Persistent Trading Research Lab";
   const description =
-    "An interactive AAPL backtesting and paper-trading dashboard with AI signals, candlesticks, indicators, and transparent execution logs.";
+    "A persistent AAPL research lab with teacher-guided training, walk-forward validation, long and short backtests, and a saved paper portfolio.";
 
   return {
     title,
