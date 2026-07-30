@@ -22,6 +22,13 @@ test("builds the complete Signal Forge application", async () => {
   assert.match(page, /Unseen holdout/);
   assert.match(page, /Portfolio history/);
   assert.match(page, /Switch to.*mode/);
+  assert.match(page, /30-minute candles/);
+  assert.match(page, /flat by 4:00 PM/i);
+  assert.match(page, /intradayEntryThreshold/);
+  assert.match(page, /tradesPerDay/);
+  assert.match(page, /Backtest sections/);
+  assert.match(page, /Training sections/);
+  assert.match(page, /Portfolio sections/);
   assert.doesNotMatch(page, /SkeletonPreview/);
 });
 

@@ -45,6 +45,9 @@ import {
 
 type MarketBar = {
   date: string;
+  time: string;
+  timestamp: string;
+  barInSession: number;
   open: number;
   high: number;
   low: number;
@@ -57,6 +60,8 @@ type MarketBar = {
   lowerBand: number;
   momentum: number;
   volatility: number;
+  vwap: number;
+  volumeRatio: number;
 };
 
 type ModelWeights = {
@@ -64,6 +69,8 @@ type ModelWeights = {
   rsi: number;
   momentum: number;
   volatility: number;
+  vwap: number;
+  volume: number;
   threshold: number;
 };
 
@@ -72,6 +79,8 @@ type Position = "LONG" | "SHORT" | "FLAT";
 type Trade = {
   id: string;
   date: string;
+  time: string;
+  timestamp: string;
   side: "BUY" | "SELL" | "SHORT" | "COVER";
   price: number;
   shares: number;
@@ -97,6 +106,9 @@ type BacktestResult = {
   confidence: number;
   longEntries: number;
   shortEntries: number;
+  roundTrips: number;
+  tradesPerDay: number;
+  averageHoldBars: number;
 };
 
 type PaperOrder = {
@@ -112,6 +124,7 @@ type PaperAccount = {
   cash: number;
   shares: number;
   avgPrice: number;
+  positionOpenedAt: number;
   realized: number;
   orders: PaperOrder[];
   equityHistory: Array<{ time: string; value: number }>;
@@ -131,7 +144,7 @@ type TrainingRun = {
 };
 
 type PersistedLabState = {
-  version: 2;
+  version: 3;
   model: ModelWeights;
   trainingEpoch: number;
   trainingRuns: TrainingRun[];
@@ -145,20 +158,23 @@ const DATA_START = "2020-01-02";
 const DATA_END = "2026-07-29";
 const DEFAULT_START = "2024-01-02";
 const DEFAULT_END = "2025-12-31";
-const STATE_VERSION = 2;
+const STATE_VERSION = 3;
 
 const INITIAL_MODEL: ModelWeights = {
-  trend: 0.49,
-  rsi: 0.18,
-  momentum: 0.24,
-  volatility: 0.09,
-  threshold: 0.24,
+  trend: 0.29,
+  rsi: 0.14,
+  momentum: 0.23,
+  volatility: 0.08,
+  vwap: 0.17,
+  volume: 0.09,
+  threshold: 0.19,
 };
 
 const INITIAL_PAPER: PaperAccount = {
   cash: PAPER_STARTING_CASH,
   shares: 0,
   avgPrice: 0,
+  positionOpenedAt: 0,
   realized: 0,
   orders: [],
   equityHistory: [],
@@ -195,11 +211,12 @@ const seededRandom = (seed: number) => {
   };
 };
 
+
 function generateMarketData(): MarketBar[] {
   const random = seededRandom(7241994);
   const raw: Omit<
     MarketBar,
-    "ema9" | "ema21" | "rsi" | "upperBand" | "lowerBand" | "momentum" | "volatility"
+    "ema9" | "ema21" | "rsi" | "upperBand" | "lowerBand" | "momentum" | "volatility" | "vwap" | "volumeRatio"
   >[] = [];
   const cursor = new Date(`${DATA_START}T12:00:00Z`);
   const lastDate = new Date(`${DATA_END}T12:00:00Z`);
@@ -209,51 +226,73 @@ function generateMarketData(): MarketBar[] {
   while (cursor <= lastDate) {
     const weekday = cursor.getUTCDay();
     if (weekday !== 0 && weekday !== 6) {
-      const trendRegime = Math.sin(session / 58) > -0.18 ? 0.00115 : -0.0017;
-      const longDrift = 0.00042 + 0.00028 * Math.sin(session / 210);
-      const pulse = 0.00135 * Math.sin(session / 17) + 0.0008 * Math.sin(session / 41);
-      const noise = (random() - 0.5) * 0.027;
-      let dailyReturn = longDrift + trendRegime + pulse + noise;
-      if (session % 233 === 0 && session > 0) dailyReturn -= 0.052;
-      if (session % 311 === 0 && session > 0) dailyReturn += 0.043;
+      const sessionDate = cursor.toISOString().slice(0, 10);
+      const trendRegime = Math.sin(session / 58) > -0.18 ? 0.0009 : -0.00115;
+      const longDrift = 0.0003 + 0.00022 * Math.sin(session / 210);
+      const pulse = 0.0012 * Math.sin(session / 17) + 0.00065 * Math.sin(session / 41);
+      let sessionReturn = longDrift + trendRegime + pulse + (random() - 0.5) * 0.021;
+      if (session % 233 === 0 && session > 0) sessionReturn -= 0.045;
+      if (session % 311 === 0 && session > 0) sessionReturn += 0.038;
 
-      const gap = (random() - 0.5) * 0.009;
-      const open = previousClose * (1 + gap);
-      const close = Math.max(18, previousClose * (1 + dailyReturn));
-      const range = 0.006 + random() * 0.017;
-      const high = Math.max(open, close) * (1 + range * (0.45 + random() * 0.55));
-      const low = Math.min(open, close) * (1 - range * (0.4 + random() * 0.5));
-      const volume = Math.round(
-        48_000_000 * (0.72 + random() * 0.76) * (1 + Math.abs(dailyReturn) * 7.5),
-      );
+      const gap = (random() - 0.5) * 0.008;
+      const sessionOpen = previousClose * (1 + gap);
+      let intradayPrice = sessionOpen;
 
-      raw.push({
-        date: cursor.toISOString().slice(0, 10),
-        open,
-        high,
-        low,
-        close,
-        volume,
-      });
-      previousClose = close;
+      for (let barInSession = 0; barInSession < 13; barInSession += 1) {
+        const totalMinutes = 570 + barInSession * 30;
+        const hour = Math.floor(totalMinutes / 60);
+        const minute = totalMinutes % 60;
+        const time = `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+        const open = intradayPrice;
+        const progress = barInSession / 12;
+        const openingPulse = barInSession < 2 ? (random() - 0.5) * 0.0042 : 0;
+        const closingPulse = barInSession > 10 ? (random() - 0.5) * 0.0032 : 0;
+        const microWave = Math.sin(session * 0.7 + barInSession * 1.35) * 0.00105;
+        const microNoise = (random() - 0.5) * (0.0052 - Math.min(progress, 1 - progress) * 0.0018);
+        const meanReversion = ((sessionOpen - open) / sessionOpen) * 0.045;
+        const barReturn = sessionReturn / 13 + openingPulse + closingPulse + microWave + microNoise + meanReversion;
+        const close = Math.max(18, open * (1 + barReturn));
+        const range = 0.0012 + random() * 0.0031;
+        const high = Math.max(open, close) * (1 + range * (0.35 + random() * 0.6));
+        const low = Math.min(open, close) * (1 - range * (0.35 + random() * 0.6));
+        const uShape = Math.pow(Math.abs(progress - 0.5) * 2, 1.5);
+        const volume = Math.round(
+          1_900_000 * (0.82 + uShape * 2.1) * (0.72 + random() * 0.72) * (1 + Math.abs(barReturn) * 42),
+        );
+
+        raw.push({
+          date: sessionDate,
+          time,
+          timestamp: `${sessionDate}-${time}`,
+          barInSession,
+          open,
+          high,
+          low,
+          close,
+          volume,
+        });
+        intradayPrice = close;
+      }
+
+      previousClose = intradayPrice;
       session += 1;
     }
     cursor.setUTCDate(cursor.getUTCDate() + 1);
   }
 
   const closes = raw.map((bar) => bar.close);
-  const returns = closes.map((close, index) =>
-    index === 0 ? 0 : close / closes[index - 1] - 1,
-  );
+  const returns = closes.map((close, index) => index === 0 ? 0 : close / closes[index - 1] - 1);
   let fast = closes[0];
   let slow = closes[0];
   let avgGain = 0;
   let avgLoss = 0;
+  let activeSession = "";
+  let cumulativeTypicalVolume = 0;
+  let cumulativeVolume = 0;
 
   return raw.map((bar, index) => {
     fast = index === 0 ? bar.close : bar.close * 0.2 + fast * 0.8;
     slow = index === 0 ? bar.close : bar.close * (2 / 22) + slow * (20 / 22);
-
     const change = index === 0 ? 0 : bar.close - closes[index - 1];
     const gain = Math.max(0, change);
     const loss = Math.max(0, -change);
@@ -267,20 +306,29 @@ function generateMarketData(): MarketBar[] {
     const rs = avgLoss === 0 ? 100 : avgGain / avgLoss;
     const rsi = avgLoss === 0 ? 100 : 100 - 100 / (1 + rs);
 
-    const bandStart = Math.max(0, index - 19);
-    const window = closes.slice(bandStart, index + 1);
-    const mean = window.reduce((sum, value) => sum + value, 0) / window.length;
+    const bandWindow = closes.slice(Math.max(0, index - 19), index + 1);
+    const mean = bandWindow.reduce((sum, value) => sum + value, 0) / bandWindow.length;
     const deviation = Math.sqrt(
-      window.reduce((sum, value) => sum + (value - mean) ** 2, 0) / window.length,
+      bandWindow.reduce((sum, value) => sum + (value - mean) ** 2, 0) / bandWindow.length,
+    );
+    const returnWindow = returns.slice(Math.max(0, index - 19), index + 1);
+    const returnMean = returnWindow.reduce((sum, value) => sum + value, 0) / returnWindow.length;
+    const volatility = Math.sqrt(
+      returnWindow.reduce((sum, value) => sum + (value - returnMean) ** 2, 0) / returnWindow.length,
     );
 
-    const returnWindow = returns.slice(Math.max(0, index - 13), index + 1);
-    const returnMean =
-      returnWindow.reduce((sum, value) => sum + value, 0) / returnWindow.length;
-    const volatility = Math.sqrt(
-      returnWindow.reduce((sum, value) => sum + (value - returnMean) ** 2, 0) /
-        returnWindow.length,
-    );
+    if (bar.date !== activeSession) {
+      activeSession = bar.date;
+      cumulativeTypicalVolume = 0;
+      cumulativeVolume = 0;
+    }
+    const typical = (bar.high + bar.low + bar.close) / 3;
+    cumulativeTypicalVolume += typical * bar.volume;
+    cumulativeVolume += bar.volume;
+    const volumeWindow = raw.slice(Math.max(0, index - 26), index);
+    const averageVolume = volumeWindow.length
+      ? volumeWindow.reduce((sum, value) => sum + value.volume, 0) / volumeWindow.length
+      : bar.volume;
 
     return {
       ...bar,
@@ -289,9 +337,10 @@ function generateMarketData(): MarketBar[] {
       rsi,
       upperBand: mean + deviation * 2,
       lowerBand: mean - deviation * 2,
-      momentum:
-        index < 10 ? 0 : bar.close / closes[Math.max(0, index - 10)] - 1,
+      momentum: index < 6 ? 0 : bar.close / closes[index - 6] - 1,
       volatility,
+      vwap: cumulativeTypicalVolume / Math.max(1, cumulativeVolume),
+      volumeRatio: clamp(bar.volume / Math.max(1, averageVolume), 0, 3),
     };
   });
 }
@@ -299,26 +348,37 @@ function generateMarketData(): MarketBar[] {
 const MARKET_DATA = generateMarketData();
 
 function scoreBar(bar: MarketBar, weights: ModelWeights) {
-  const trend = clamp(((bar.ema9 - bar.ema21) / bar.close) * 45, -1, 1);
-  const rsiEdge = clamp((52 - bar.rsi) / 28, -1, 1);
-  const momentum = clamp(bar.momentum / 0.055, -1, 1);
-  const volatility = clamp((0.017 - bar.volatility) / 0.017, -1, 1);
+  const trend = clamp(((bar.ema9 - bar.ema21) / bar.close) * 130, -1, 1);
+  const rsiEdge = clamp((50 - bar.rsi) / 24, -1, 1);
+  const momentum = clamp(bar.momentum / 0.018, -1, 1);
+  const volatility = clamp((0.006 - bar.volatility) / 0.006, -1, 1);
+  const vwap = clamp(((bar.close - bar.vwap) / bar.close) * 150, -1, 1);
+  const volume = clamp((bar.volumeRatio - 1) * 0.72, -1, 1);
   const score =
     trend * weights.trend +
     rsiEdge * weights.rsi +
     momentum * weights.momentum +
-    volatility * weights.volatility;
+    volatility * weights.volatility +
+    vwap * weights.vwap +
+    volume * weights.volume;
 
   return {
     score: clamp(score, -1, 1),
-    factors: { trend, rsi: rsiEdge, momentum, volatility },
+    factors: { trend, rsi: rsiEdge, momentum, volatility, vwap, volume },
   };
 }
+
+function intradayEntryThreshold(weights: ModelWeights) {
+  return clamp(weights.threshold * 0.45, 0.065, 0.105);
+}
+
 
 function runBacktest(
   data: MarketBar[],
   weights: ModelWeights,
   startingCapital = STARTING_CAPITAL,
+  collectTrades = true,
+  collectSeries = collectTrades,
 ): BacktestResult {
   if (data.length < 2) {
     return {
@@ -337,172 +397,224 @@ function runBacktest(
       confidence: 50,
       longEntries: 0,
       shortEntries: 0,
+      roundTrips: 0,
+      tradesPerDay: 0,
+      averageHoldBars: 0,
     };
   }
 
   let cash = startingCapital;
   let shares = 0;
   let entryPrice = 0;
+  let entryIndex = -1;
   let peak = startingCapital;
   let maxDrawdown = 0;
-  const trades: Trade[] = [];
-  const equity: number[] = [];
-  const scores: number[] = [];
-  const dailyReturns: number[] = [];
-  const holdShares = startingCapital / data[0].close;
-  const buyHoldEquity = data.map((bar) => holdShares * bar.close);
   let previousEquity = startingCapital;
   let wins = 0;
   let exits = 0;
   let longEntries = 0;
   let shortEntries = 0;
+  let totalHoldBars = 0;
+  let latestScore = 0;
+  let returnCount = 0;
+  let averageReturn = 0;
+  let returnSquaredDelta = 0;
+  let currentSession = "";
+  let entriesThisSession = 0;
+  let cooldownBars = 0;
+  const sessions = new Set<string>();
+  const trades: Trade[] = [];
+  const equity: number[] = [];
+  const scores: number[] = [];
+  const holdShares = startingCapital / data[0].close;
+  const buyHoldEquity = collectSeries ? data.map((bar) => holdShares * bar.close) : [];
+
+  const commission = (notional: number) => 0.35 + notional * 0.00002;
+  const factorReason = (bar: MarketBar) => {
+    const factors = scoreBar(bar, weights).factors;
+    const labels: Array<[keyof typeof factors, string]> = [
+      ["trend", "EMA trend"],
+      ["rsi", "RSI reversal"],
+      ["momentum", "Momentum"],
+      ["vwap", "VWAP displacement"],
+      ["volume", "Volume expansion"],
+      ["volatility", "Volatility regime"],
+    ];
+    labels.sort((a, b) => Math.abs(factors[b[0]]) - Math.abs(factors[a[0]]));
+    return `${labels[0][1]} setup`;
+  };
 
   data.forEach((bar, index) => {
-    const { score } = scoreBar(bar, weights);
-    scores.push(score);
+    sessions.add(bar.date);
+    if (bar.date !== currentSession) {
+      currentSession = bar.date;
+      entriesThisSession = 0;
+      cooldownBars = 0;
+    }
+    if (cooldownBars > 0) cooldownBars -= 1;
+
+    const scored = scoreBar(bar, weights);
+    const score = scored.score;
+    latestScore = score;
+    if (collectSeries) scores.push(score);
     const confidence = Math.round(50 + Math.min(0.49, Math.abs(score)) * 100);
-    const canTrade = index > 22;
-    const fee = 1;
     const longReturn = shares > 0 && entryPrice > 0 ? bar.close / entryPrice - 1 : 0;
     const shortReturn = shares < 0 && entryPrice > 0 ? entryPrice / bar.close - 1 : 0;
+    const heldBars = entryIndex >= 0 ? index - entryIndex : 0;
+    const sessionClose = bar.barInSession === 12;
 
     if (
-      canTrade &&
-      shares === 0 &&
-      score > weights.threshold &&
-      bar.ema9 > bar.ema21 &&
-      bar.rsi < 76
-    ) {
-      const fill = bar.close * 1.0006;
-      const quantity = Math.floor((cash * 0.92 - fee) / fill);
-      if (quantity > 0) {
-        const cost = quantity * fill + fee;
-        cash -= cost;
-        shares = quantity;
-        entryPrice = fill;
-        longEntries += 1;
-        trades.push({
-          id: `buy-${bar.date}-${index}`,
-          date: bar.date,
-          side: "BUY",
-          price: fill,
-          shares: quantity,
-          value: cost,
-          pnl: null,
-          confidence,
-          reason: bar.rsi < 48 ? "Trend + RSI recovery" : "Momentum crossover",
-        });
-      }
-    } else if (
-      canTrade &&
-      shares === 0 &&
-      score < -weights.threshold &&
-      bar.ema9 < bar.ema21 &&
-      bar.rsi > 24
-    ) {
-      const fill = bar.close * 0.9994;
-      const quantity = Math.floor((cash * 0.72 - fee) / fill);
-      if (quantity > 0) {
-        const proceeds = quantity * fill - fee;
-        cash += proceeds;
-        shares = -quantity;
-        entryPrice = fill;
-        shortEntries += 1;
-        trades.push({
-          id: `short-${bar.date}-${index}`,
-          date: bar.date,
-          side: "SHORT",
-          price: fill,
-          shares: quantity,
-          value: proceeds,
-          pnl: null,
-          confidence,
-          reason: bar.rsi > 62 ? "Hindsight-taught reversal" : "Bearish trend break",
-        });
-      }
-    } else if (
-      canTrade &&
       shares > 0 &&
-      (score < weights.threshold * 0.05 ||
-        (bar.ema9 < bar.ema21 && score < 0) ||
-        bar.rsi > 79 ||
-        longReturn < -0.09)
+      (sessionClose || longReturn >= 0.0065 || longReturn <= -0.0048 || heldBars >= 2 || score < -0.015)
     ) {
-      const fill = bar.close * 0.9994;
-      const proceeds = shares * fill - fee;
-      const pnl = (fill - entryPrice) * shares - fee * 2;
+      const fill = bar.close * 0.9998;
+      const notional = shares * fill;
+      const fee = commission(notional);
+      const proceeds = notional - fee;
+      const pnl = (fill - entryPrice) * shares - fee - commission(shares * entryPrice);
       cash += proceeds;
       exits += 1;
+      totalHoldBars += heldBars;
       if (pnl > 0) wins += 1;
-      trades.push({
-        id: `sell-${bar.date}-${index}`,
+      if (collectTrades) trades.push({
+        id: `sell-${bar.timestamp}-${index}`,
         date: bar.date,
+        time: bar.time,
+        timestamp: bar.timestamp,
         side: "SELL",
         price: fill,
         shares,
         value: proceeds,
         pnl,
         confidence,
-        reason: longReturn < -0.09 ? "Long stop-loss" : bar.rsi > 79 ? "Overbought guardrail" : "Close long",
+        reason: sessionClose ? "Closing bell" : longReturn >= 0.0065 ? "Profit target" : longReturn <= -0.0048 ? "Risk stop" : heldBars >= 2 ? "Time stop" : "Signal reversed",
       });
       shares = 0;
       entryPrice = 0;
+      entryIndex = -1;
+      cooldownBars = 1;
     } else if (
-      canTrade &&
       shares < 0 &&
-      (score > -weights.threshold * 0.05 ||
-        (bar.ema9 > bar.ema21 && score > 0) ||
-        bar.rsi < 22 ||
-        shortReturn < -0.09)
+      (sessionClose || shortReturn >= 0.0065 || shortReturn <= -0.0048 || heldBars >= 2 || score > 0.015)
     ) {
       const quantity = Math.abs(shares);
-      const fill = bar.close * 1.0006;
-      const cost = quantity * fill + fee;
-      const pnl = (entryPrice - fill) * quantity - fee * 2;
+      const fill = bar.close * 1.0002;
+      const notional = quantity * fill;
+      const fee = commission(notional);
+      const cost = notional + fee;
+      const pnl = (entryPrice - fill) * quantity - fee - commission(quantity * entryPrice);
       cash -= cost;
       exits += 1;
+      totalHoldBars += heldBars;
       if (pnl > 0) wins += 1;
-      trades.push({
-        id: `cover-${bar.date}-${index}`,
+      if (collectTrades) trades.push({
+        id: `cover-${bar.timestamp}-${index}`,
         date: bar.date,
+        time: bar.time,
+        timestamp: bar.timestamp,
         side: "COVER",
         price: fill,
         shares: quantity,
         value: cost,
         pnl,
         confidence,
-        reason: shortReturn < -0.09 ? "Short stop-loss" : bar.rsi < 22 ? "Oversold guardrail" : "Cover short",
+        reason: sessionClose ? "Closing bell" : shortReturn >= 0.0065 ? "Profit target" : shortReturn <= -0.0048 ? "Risk stop" : heldBars >= 2 ? "Time stop" : "Signal reversed",
       });
       shares = 0;
       entryPrice = 0;
+      entryIndex = -1;
+      cooldownBars = 1;
+    } else if (
+      index > 30 &&
+      shares === 0 &&
+      cooldownBars === 0 &&
+      entriesThisSession < 6 &&
+      bar.barInSession >= 1 &&
+      bar.barInSession <= 10 &&
+      bar.volumeRatio > 0.4
+    ) {
+      const entryThreshold = intradayEntryThreshold(weights);
+      const portfolioValue = cash;
+      const allocation = portfolioValue * 0.46;
+      if (score > entryThreshold) {
+        const fill = bar.close * 1.0002;
+        const quantity = Math.floor(allocation / fill);
+        if (quantity > 0) {
+          const notional = quantity * fill;
+          const fee = commission(notional);
+          const cost = notional + fee;
+          if (cost <= cash) {
+            cash -= cost;
+            shares = quantity;
+            entryPrice = fill;
+            entryIndex = index;
+            entriesThisSession += 1;
+            longEntries += 1;
+            if (collectTrades) trades.push({
+              id: `buy-${bar.timestamp}-${index}`,
+              date: bar.date,
+              time: bar.time,
+              timestamp: bar.timestamp,
+              side: "BUY",
+              price: fill,
+              shares: quantity,
+              value: cost,
+              pnl: null,
+              confidence,
+              reason: collectTrades ? factorReason(bar) : "Indicator setup",
+            });
+          }
+        }
+      } else if (score < -entryThreshold) {
+        const fill = bar.close * 0.9998;
+        const quantity = Math.floor(allocation / fill);
+        if (quantity > 0) {
+          const notional = quantity * fill;
+          const fee = commission(notional);
+          const proceeds = notional - fee;
+          cash += proceeds;
+          shares = -quantity;
+          entryPrice = fill;
+          entryIndex = index;
+          entriesThisSession += 1;
+          shortEntries += 1;
+          if (collectTrades) trades.push({
+            id: `short-${bar.timestamp}-${index}`,
+            date: bar.date,
+            time: bar.time,
+            timestamp: bar.timestamp,
+            side: "SHORT",
+            price: fill,
+            shares: quantity,
+            value: proceeds,
+            pnl: null,
+            confidence,
+            reason: collectTrades ? factorReason(bar) : "Indicator setup",
+          });
+        }
+      }
     }
 
-    if (shares < 0) cash -= Math.abs(shares) * bar.close * 0.00003;
     const portfolioValue = cash + shares * bar.close;
-    equity.push(portfolioValue);
+    if (collectSeries) equity.push(portfolioValue);
     peak = Math.max(peak, portfolioValue);
     maxDrawdown = Math.min(maxDrawdown, portfolioValue / peak - 1);
-    if (index > 0) dailyReturns.push(portfolioValue / previousEquity - 1);
+    if (index > 0) {
+      const barReturn = portfolioValue / previousEquity - 1;
+      returnCount += 1;
+      const delta = barReturn - averageReturn;
+      averageReturn += delta / returnCount;
+      returnSquaredDelta += delta * (barReturn - averageReturn);
+    }
     previousEquity = portfolioValue;
   });
 
   const finalValue = cash + shares * data[data.length - 1].close;
   const strategyReturn = finalValue / startingCapital - 1;
-  const buyHoldReturn = buyHoldEquity[buyHoldEquity.length - 1] / startingCapital - 1;
-  const averageReturn =
-    dailyReturns.reduce((sum, value) => sum + value, 0) /
-    Math.max(1, dailyReturns.length);
-  const returnDeviation = Math.sqrt(
-    dailyReturns.reduce((sum, value) => sum + (value - averageReturn) ** 2, 0) /
-      Math.max(1, dailyReturns.length),
-  );
-  const latestScore = scores[scores.length - 1];
-  const signal =
-    latestScore > weights.threshold
-      ? "BUY"
-      : latestScore < -weights.threshold
-        ? "SHORT"
-        : "HOLD";
+  const buyHoldReturn = data[data.length - 1].close / data[0].close - 1;
+  const returnDeviation = Math.sqrt(returnSquaredDelta / Math.max(1, returnCount));
+  const entryThreshold = intradayEntryThreshold(weights);
+  const signal = latestScore > entryThreshold ? "BUY" : latestScore < -entryThreshold ? "SHORT" : "HOLD";
 
   return {
     finalValue,
@@ -510,7 +622,7 @@ function runBacktest(
     buyHoldReturn,
     alpha: strategyReturn - buyHoldReturn,
     maxDrawdown,
-    sharpe: returnDeviation === 0 ? 0 : (averageReturn / returnDeviation) * Math.sqrt(252),
+    sharpe: returnDeviation === 0 ? 0 : (averageReturn / returnDeviation) * Math.sqrt(252 * 13),
     winRate: exits === 0 ? 0 : wins / exits,
     trades,
     equity,
@@ -520,22 +632,30 @@ function runBacktest(
     confidence: Math.round(50 + Math.min(0.49, Math.abs(latestScore)) * 100),
     longEntries,
     shortEntries,
+    roundTrips: exits,
+    tradesPerDay: exits / Math.max(1, sessions.size),
+    averageHoldBars: exits === 0 ? 0 : totalHoldBars / exits,
   };
 }
 
 function oracleAction(data: MarketBar[], index: number): Position {
-  const futureIndex = Math.min(data.length - 1, index + 4);
+  let futureIndex = index;
+  for (let offset = 1; offset <= 4 && index + offset < data.length; offset += 1) {
+    if (data[index + offset].date !== data[index].date) break;
+    futureIndex = index + offset;
+  }
   if (futureIndex <= index) return "FLAT";
   const futureReturn = data[futureIndex].close / data[index].close - 1;
-  if (futureReturn > 0.006) return "LONG";
-  if (futureReturn < -0.006) return "SHORT";
+  if (futureReturn > 0.0025) return "LONG";
+  if (futureReturn < -0.0025) return "SHORT";
   return "FLAT";
 }
 
 function policyAction(bar: MarketBar, weights: ModelWeights): Position {
   const score = scoreBar(bar, weights).score;
-  if (score > weights.threshold) return "LONG";
-  if (score < -weights.threshold) return "SHORT";
+  const threshold = intradayEntryThreshold(weights);
+  if (score > threshold) return "LONG";
+  if (score < -threshold) return "SHORT";
   return "FLAT";
 }
 
@@ -562,10 +682,12 @@ function splitForTraining(data: MarketBar[]) {
 
 function evaluateModel(data: MarketBar[], weights: ModelWeights) {
   const { trainingData, validationData } = splitForTraining(data);
-  const trainingResult = runBacktest(trainingData, weights);
-  const validationResult = runBacktest(validationData, weights);
+  const trainingResult = runBacktest(trainingData, weights, STARTING_CAPITAL, false);
+  const validationResult = runBacktest(validationData, weights, STARTING_CAPITAL, false);
   const agreement = teacherAgreement(trainingData, weights);
-  const turnoverPenalty = Math.max(0, trainingResult.trades.length / Math.max(1, trainingData.length) - 0.16);
+  const turnoverPenalty = Math.max(0, trainingResult.roundTrips / Math.max(1, trainingData.length / 13) - 4.2);
+  const undertradingPenalty = Math.max(0, 1.5 - validationResult.tradesPerDay);
+  const cadenceReward = Math.min(2.5, validationResult.tradesPerDay) * 0.008;
   const objective =
     validationResult.strategyReturn * 0.52 +
     validationResult.alpha * 0.38 +
@@ -573,13 +695,15 @@ function evaluateModel(data: MarketBar[], weights: ModelWeights) {
     Math.abs(validationResult.maxDrawdown) * 0.32 +
     trainingResult.strategyReturn * 0.12 +
     agreement * 0.12 -
-    turnoverPenalty * 0.08;
+    turnoverPenalty * 0.015 -
+    undertradingPenalty * 0.03 +
+    cadenceReward;
 
   return { objective, agreement, trainingResult, validationResult };
 }
 
 function teacherSeedModel(data: MarketBar[], current: ModelWeights): ModelWeights {
-  const totals = { trend: 0, rsi: 0, momentum: 0, volatility: 0 };
+  const totals = { trend: 0, rsi: 0, momentum: 0, volatility: 0, vwap: 0, volume: 0 };
   let examples = 0;
   for (let index = 22; index < data.length - 4; index += 1) {
     const teacher = oracleAction(data, index);
@@ -589,6 +713,8 @@ function teacherSeedModel(data: MarketBar[], current: ModelWeights): ModelWeight
     totals.rsi += factors.rsi * target;
     totals.momentum += factors.momentum * target;
     totals.volatility += factors.volatility * target;
+    totals.vwap += factors.vwap * target;
+    totals.volume += factors.volume * target;
     examples += 1;
   }
 
@@ -598,25 +724,30 @@ function teacherSeedModel(data: MarketBar[], current: ModelWeights): ModelWeight
     rsi: Math.max(0.02, totals.rsi / examples),
     momentum: Math.max(0.02, totals.momentum / examples),
     volatility: Math.max(0.01, totals.volatility / examples),
+    vwap: Math.max(0.02, totals.vwap / examples),
+    volume: Math.max(0.01, totals.volume / examples),
   };
-  const sum = learned.trend + learned.rsi + learned.momentum + learned.volatility;
+  const sum = learned.trend + learned.rsi + learned.momentum + learned.volatility + learned.vwap + learned.volume;
   const blend = 0.34;
   return normalizeModel({
     trend: current.trend * (1 - blend) + (learned.trend / sum) * blend,
     rsi: current.rsi * (1 - blend) + (learned.rsi / sum) * blend,
     momentum: current.momentum * (1 - blend) + (learned.momentum / sum) * blend,
     volatility: current.volatility * (1 - blend) + (learned.volatility / sum) * blend,
-    threshold: current.threshold * 0.8 + 0.22 * 0.2,
+    vwap: current.vwap * (1 - blend) + (learned.vwap / sum) * blend,
+    volume: current.volume * (1 - blend) + (learned.volume / sum) * blend,
+    threshold: current.threshold * 0.8 + 0.18 * 0.2,
   });
 }
 
-function dateLabel(date: string) {
-  return new Intl.DateTimeFormat("en-US", {
+function dateLabel(date: string, time?: string) {
+  const day = new Intl.DateTimeFormat("en-US", {
     month: "short",
     day: "numeric",
     year: "numeric",
     timeZone: "UTC",
   }).format(new Date(`${date}T12:00:00Z`));
+  return time ? `${day} / ${time} ET` : day;
 }
 
 function getMarketClock(now: Date | null) {
@@ -662,7 +793,7 @@ function MarketChart({
 }: {
   data: MarketBar[];
   result: BacktestResult;
-  viewport: "ALL" | "1Y" | "6M" | "3M";
+  viewport: "ALL" | "1M" | "2W" | "5D";
   theme: "light" | "dark";
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -671,17 +802,18 @@ function MarketChart({
   const [hovered, setHovered] = useState<number | null>(null);
   const [layers, setLayers] = useState({
     averages: true,
+    vwap: true,
     bands: true,
     rsi: true,
     trades: true,
   });
 
-  const requestedBars = viewport === "ALL" ? data.length : viewport === "1Y" ? 252 : viewport === "6M" ? 126 : 63;
+  const requestedBars = viewport === "ALL" ? data.length : viewport === "1M" ? 13 * 22 : viewport === "2W" ? 13 * 10 : 13 * 5;
   const offset = Math.max(0, data.length - requestedBars);
   const visible = data.slice(offset);
   const visibleScores = result.scores.slice(offset);
-  const tradeByDate = useMemo(
-    () => new Map(result.trades.map((trade) => [trade.date, trade])),
+  const tradeByTimestamp = useMemo(
+    () => new Map(result.trades.map((trade) => [trade.timestamp, trade])),
     [result.trades],
   );
 
@@ -829,9 +961,21 @@ function MarketChart({
       context.lineWidth = 1;
     }
 
+    if (layers.vwap) {
+      context.beginPath();
+      visible.forEach((bar, index) => {
+        if (index === 0) context.moveTo(x(index), yPrice(bar.vwap));
+        else context.lineTo(x(index), yPrice(bar.vwap));
+      });
+      context.strokeStyle = "#4fa7e8";
+      context.lineWidth = 1.35;
+      context.stroke();
+      context.lineWidth = 1;
+    }
+
     if (layers.trades) {
       visible.forEach((bar, index) => {
-        const trade = tradeByDate.get(bar.date);
+        const trade = tradeByTimestamp.get(bar.timestamp);
         if (!trade) return;
         const isBuyAction = trade.side === "BUY" || trade.side === "COVER";
         const markerY =
@@ -896,12 +1040,14 @@ function MarketChart({
     const labelCount = width < 650 ? 3 : 5;
     for (let label = 0; label < labelCount; label += 1) {
       const index = Math.round((visible.length - 1) * (label / (labelCount - 1)));
-      const date = new Date(`${visible[index].date}T12:00:00Z`);
-      const text = new Intl.DateTimeFormat("en-US", {
+      const bar = visible[index];
+      const date = new Date(`${bar.date}T12:00:00Z`);
+      const day = new Intl.DateTimeFormat("en-US", {
         month: "short",
         day: "numeric",
         timeZone: "UTC",
       }).format(date);
+      const text = `${day} ${bar.time}`;
       context.fillStyle = mutedAxisColor;
       context.textAlign = label === 0 ? "left" : label === labelCount - 1 ? "right" : "center";
       context.fillText(text, x(index), height - 7);
@@ -921,7 +1067,7 @@ function MarketChart({
       context.arc(crossX, yPrice(visible[hovered].close), 3, 0, Math.PI * 2);
       context.fill();
     }
-  }, [visible, visibleScores, layers, hovered, revision, tradeByDate, theme]);
+  }, [visible, visibleScores, layers, hovered, revision, tradeByTimestamp, theme]);
 
   const pointerMove = (event: React.PointerEvent<HTMLCanvasElement>) => {
     if (!canvasRef.current || visible.length < 2) return;
@@ -934,7 +1080,7 @@ function MarketChart({
   };
 
   const hoverBar = hovered === null ? null : visible[hovered];
-  const hoverTrade = hoverBar ? tradeByDate.get(hoverBar.date) : null;
+  const hoverTrade = hoverBar ? tradeByTimestamp.get(hoverBar.timestamp) : null;
 
   const toggleLayer = (key: keyof typeof layers) =>
     setLayers((current) => ({ ...current, [key]: !current[key] }));
@@ -948,6 +1094,13 @@ function MarketChart({
           type="button"
         >
           <span className="legend-swatch double" /> EMA 9 / 21
+        </button>
+        <button
+          className={layers.vwap ? "legend-chip active" : "legend-chip"}
+          onClick={() => toggleLayer("vwap")}
+          type="button"
+        >
+          <span className="legend-swatch vwap" /> VWAP
         </button>
         <button
           className={layers.bands ? "legend-chip active" : "legend-chip"}
@@ -977,7 +1130,7 @@ function MarketChart({
           ref={canvasRef}
           onPointerMove={pointerMove}
           onPointerLeave={() => setHovered(null)}
-          aria-label="AAPL candlestick chart with EMA, Bollinger Bands, RSI, policy score, volume, and trade markers"
+          aria-label="AAPL intraday candlestick chart with EMA, VWAP, Bollinger Bands, RSI, policy score, volume, and trade markers"
           role="img"
         />
         {hoverBar && (
@@ -985,7 +1138,7 @@ function MarketChart({
             className={hovered !== null && hovered > visible.length * 0.66 ? "chart-tooltip left" : "chart-tooltip"}
           >
             <div className="tooltip-date">
-              <span>{dateLabel(hoverBar.date)}</span>
+              <span>{dateLabel(hoverBar.date, hoverBar.time)}</span>
               {hoverTrade && <b className={hoverTrade.side === "BUY" || hoverTrade.side === "COVER" ? "buy" : "sell"}>{hoverTrade.side}</b>}
             </div>
             <div className="tooltip-values">
@@ -997,7 +1150,8 @@ function MarketChart({
             <div className="tooltip-values muted">
               <span>RSI <b>{hoverBar.rsi.toFixed(1)}</b></span>
               <span>Score <b>{visibleScores[hovered ?? 0]?.toFixed(2)}</b></span>
-              <span>Vol <b>{compact(hoverBar.volume)}</b></span>
+              <span>VWAP <b>{hoverBar.vwap.toFixed(2)}</b></span>
+              <span>Vol <b>{compact(hoverBar.volume)} / {hoverBar.volumeRatio.toFixed(1)}x</b></span>
             </div>
           </div>
         )}
@@ -1195,14 +1349,18 @@ function normalizeModel(value: unknown): ModelWeights {
     rsi: clamp(finiteNumber(model.rsi, INITIAL_MODEL.rsi), 0.02, 0.65),
     momentum: clamp(finiteNumber(model.momentum, INITIAL_MODEL.momentum), 0.02, 0.72),
     volatility: clamp(finiteNumber(model.volatility, INITIAL_MODEL.volatility), 0.01, 0.5),
+    vwap: clamp(finiteNumber(model.vwap, INITIAL_MODEL.vwap), 0.02, 0.65),
+    volume: clamp(finiteNumber(model.volume, INITIAL_MODEL.volume), 0.01, 0.45),
   };
-  const sum = raw.trend + raw.rsi + raw.momentum + raw.volatility;
+  const sum = raw.trend + raw.rsi + raw.momentum + raw.volatility + raw.vwap + raw.volume;
   return {
     trend: raw.trend / sum,
     rsi: raw.rsi / sum,
     momentum: raw.momentum / sum,
     volatility: raw.volatility / sum,
-    threshold: clamp(finiteNumber(model.threshold, INITIAL_MODEL.threshold), 0.1, 0.5),
+    vwap: raw.vwap / sum,
+    volume: raw.volume / sum,
+    threshold: clamp(finiteNumber(model.threshold, INITIAL_MODEL.threshold), 0.1, 0.38),
   };
 }
 
@@ -1212,6 +1370,7 @@ function normalizePaper(value: unknown): PaperAccount {
     cash: finiteNumber(paper.cash, PAPER_STARTING_CASH),
     shares: Math.trunc(finiteNumber(paper.shares, 0)),
     avgPrice: Math.max(0, finiteNumber(paper.avgPrice, 0)),
+    positionOpenedAt: Math.max(0, finiteNumber(paper.positionOpenedAt, 0)),
     realized: finiteNumber(paper.realized, 0),
     orders: Array.isArray(paper.orders) ? paper.orders.slice(0, 80) : [],
     equityHistory: Array.isArray(paper.equityHistory) ? paper.equityHistory.slice(-120) : [],
@@ -1239,8 +1398,11 @@ export default function Home() {
   const [draftStart, setDraftStart] = useState(DEFAULT_START);
   const [draftEnd, setDraftEnd] = useState(DEFAULT_END);
   const [range, setRange] = useState({ start: DEFAULT_START, end: DEFAULT_END });
-  const [viewport, setViewport] = useState<"ALL" | "1Y" | "6M" | "3M">("6M");
+  const [viewport, setViewport] = useState<"ALL" | "1M" | "2W" | "5D">("2W");
   const [activeView, setActiveView] = useState<"chart" | "train" | "paper">("chart");
+  const [backtestTab, setBacktestTab] = useState<"chart" | "performance" | "trades">("chart");
+  const [trainingTab, setTrainingTab] = useState<"run" | "checkpoints" | "policy">("run");
+  const [portfolioTab, setPortfolioTab] = useState<"account" | "orders" | "automation">("account");
   const [theme, setTheme] = useState<"light" | "dark">("dark");
   const [themeReady, setThemeReady] = useState(false);
   const [model, setModel] = useState(INITIAL_MODEL);
@@ -1266,8 +1428,9 @@ export default function Home() {
     [range],
   );
   const result = useMemo(() => runBacktest(filteredData, model), [filteredData, model]);
+  const sessionCount = useMemo(() => new Set(filteredData.map((bar) => bar.date)).size, [filteredData]);
   const trainingEvaluation = useMemo(
-    () => (filteredData.length >= 100 ? evaluateModel(filteredData, model) : null),
+    () => (filteredData.length >= 260 ? evaluateModel(filteredData, model) : null),
     [filteredData, model],
   );
   const latest = filteredData[filteredData.length - 1] ?? MARKET_DATA[MARKET_DATA.length - 1];
@@ -1390,12 +1553,14 @@ export default function Home() {
     const timer = window.setInterval(() => {
       tickRef.current += 1;
       setPaperPrice((currentPrice) => {
-        const wave = Math.sin(tickRef.current / 3.2) * 0.0011;
-        const noise = (Math.random() - 0.5) * 0.0025;
+        const wave = Math.sin(tickRef.current / 2.4) * 0.0016;
+        const noise = (Math.random() - 0.5) * 0.0031;
         const nextPrice = Math.max(1, currentPrice * (1 + wave + noise));
-        if (tickRef.current % 6 === 0) {
+        if (tickRef.current % 2 === 0) {
           const liveScore = clamp(
-            result.scores[result.scores.length - 1] + Math.sin(tickRef.current / 5) * 0.28,
+            result.scores[result.scores.length - 1] +
+              Math.sin(tickRef.current / 3.1) * 0.43 +
+              Math.sin(tickRef.current / 1.7) * 0.16,
             -1,
             1,
           );
@@ -1406,10 +1571,13 @@ export default function Home() {
               second: "2-digit",
               timeZone: "America/New_York",
             }).format(new Date());
-            const threshold = Math.max(0.28, model.threshold);
+            const threshold = intradayEntryThreshold(model);
             const equity = account.cash + account.shares * nextPrice;
-            const quantity = Math.max(1, Math.floor(Math.min(28, (equity * 0.22) / nextPrice)));
+            const quantity = Math.max(1, Math.floor((equity * 0.46) / nextPrice));
             const stamp = Date.now();
+            const longReturn = account.shares > 0 && account.avgPrice > 0 ? nextPrice / account.avgPrice - 1 : 0;
+            const shortReturn = account.shares < 0 && account.avgPrice > 0 ? account.avgPrice / nextPrice - 1 : 0;
+            const timedExit = account.positionOpenedAt > 0 && stamp - account.positionOpenedAt >= 8_000;
 
             const remember = (next: PaperAccount) => ({
               ...next,
@@ -1428,6 +1596,7 @@ export default function Home() {
                 cash: account.cash - cost,
                 shares: quantity,
                 avgPrice: nextPrice,
+                positionOpenedAt: stamp,
                 orders: [{ id: `paper-buy-${stamp}`, time, side: "BUY", shares: quantity, price: nextPrice, note: "Policy opened a long" }, ...account.orders],
               });
             }
@@ -1438,10 +1607,11 @@ export default function Home() {
                 cash: account.cash + proceeds,
                 shares: -quantity,
                 avgPrice: nextPrice,
+                positionOpenedAt: stamp,
                 orders: [{ id: `paper-short-${stamp}`, time, side: "SHORT", shares: quantity, price: nextPrice, note: "Policy opened a short" }, ...account.orders],
               });
             }
-            if (account.shares > 0 && liveScore < 0.04) {
+            if (account.shares > 0 && (liveScore < -0.015 || longReturn >= 0.0065 || longReturn <= -0.0048 || timedExit)) {
               const proceeds = account.shares * nextPrice - 1;
               const realized = (nextPrice - account.avgPrice) * account.shares - 2;
               return remember({
@@ -1449,11 +1619,12 @@ export default function Home() {
                 cash: account.cash + proceeds,
                 shares: 0,
                 avgPrice: 0,
+                positionOpenedAt: 0,
                 realized: account.realized + realized,
-                orders: [{ id: `paper-sell-${stamp}`, time, side: "SELL", shares: account.shares, price: nextPrice, note: "Policy closed the long" }, ...account.orders],
+                orders: [{ id: `paper-sell-${stamp}`, time, side: "SELL", shares: account.shares, price: nextPrice, note: longReturn >= 0.0065 ? "Profit target" : longReturn <= -0.0048 ? "Risk stop" : timedExit ? "Time stop" : "Signal reversed" }, ...account.orders],
               });
             }
-            if (account.shares < 0 && liveScore > -0.04) {
+            if (account.shares < 0 && (liveScore > 0.015 || shortReturn >= 0.0065 || shortReturn <= -0.0048 || timedExit)) {
               const coverShares = Math.abs(account.shares);
               const cost = coverShares * nextPrice + 1;
               const realized = (account.avgPrice - nextPrice) * coverShares - 2;
@@ -1462,8 +1633,9 @@ export default function Home() {
                 cash: account.cash - cost,
                 shares: 0,
                 avgPrice: 0,
+                positionOpenedAt: 0,
                 realized: account.realized + realized,
-                orders: [{ id: `paper-cover-${stamp}`, time, side: "COVER", shares: coverShares, price: nextPrice, note: "Policy covered the short" }, ...account.orders],
+                orders: [{ id: `paper-cover-${stamp}`, time, side: "COVER", shares: coverShares, price: nextPrice, note: shortReturn >= 0.0065 ? "Profit target" : shortReturn <= -0.0048 ? "Risk stop" : timedExit ? "Time stop" : "Signal reversed" }, ...account.orders],
               });
             }
             return remember(account);
@@ -1473,18 +1645,56 @@ export default function Home() {
       });
     }, 1800);
     return () => window.clearInterval(timer);
-  }, [paperActive, replayMode, marketClock.isOpen, model.threshold, result.scores]);
+  }, [paperActive, replayMode, marketClock.isOpen, model, result.scores]);
+
+  useEffect(() => {
+    if (marketClock.isOpen || replayMode || paper.shares === 0) return;
+    const timer = window.setTimeout(() => {
+      setPaper((account) => {
+        if (account.shares === 0) return account;
+        const quantity = Math.abs(account.shares);
+        const time = "4:00 PM";
+        const stamp = Date.now();
+        if (account.shares > 0) {
+          const proceeds = quantity * paperPrice - 1;
+          const realized = (paperPrice - account.avgPrice) * quantity - 2;
+          return {
+            ...account,
+            cash: account.cash + proceeds,
+            shares: 0,
+            avgPrice: 0,
+            positionOpenedAt: 0,
+            realized: account.realized + realized,
+            orders: [{ id: `paper-close-${stamp}`, time, side: "SELL", shares: quantity, price: paperPrice, note: "Closing bell / no overnight risk" }, ...account.orders].slice(0, 80),
+          };
+        }
+        const cost = quantity * paperPrice + 1;
+        const realized = (account.avgPrice - paperPrice) * quantity - 2;
+        return {
+          ...account,
+          cash: account.cash - cost,
+          shares: 0,
+          avgPrice: 0,
+          positionOpenedAt: 0,
+          realized: account.realized + realized,
+          orders: [{ id: `paper-cover-close-${stamp}`, time, side: "COVER", shares: quantity, price: paperPrice, note: "Closing bell / no overnight risk" }, ...account.orders].slice(0, 80),
+        };
+      });
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [marketClock.isOpen, paper.shares, paperPrice, replayMode]);
 
   const applyRange = () => {
     if (!draftStart || !draftEnd || draftStart >= draftEnd) {
       setRangeError("Choose an end date after the start date.");
       return;
     }
-    const count = MARKET_DATA.filter(
+    const bars = MARKET_DATA.filter(
       (bar) => bar.date >= draftStart && bar.date <= draftEnd,
-    ).length;
-    if (count < 35) {
-      setRangeError("Use at least 35 trading sessions so the indicators can warm up.");
+    );
+    const count = new Set(bars.map((bar) => bar.date)).size;
+    if (count < 10) {
+      setRangeError("Use at least 10 market days so the intraday indicators can warm up.");
       return;
     }
     setRangeError("");
@@ -1493,15 +1703,15 @@ export default function Home() {
     window.setTimeout(() => {
       setRange({ start: draftStart, end: draftEnd });
       setIsRunning(false);
-      setToast(`Backtest complete · ${count} sessions`);
+      setToast(`Backtest complete / ${count} days / ${bars.length} candles`);
     }, 520);
   };
 
 
   const trainModel = useCallback(async () => {
     if (training) return;
-    if (filteredData.length < 100) {
-      setToast("Training needs at least 100 market sessions for a holdout window");
+    if (filteredData.length < 260) {
+      setToast("Training needs at least 20 market days for a holdout window");
       return;
     }
 
@@ -1524,25 +1734,29 @@ export default function Home() {
       bestObjective = teacherSeedEvaluation.objective;
     }
 
-    const maxEpochs = 140;
+    const maxEpochs = 90;
     let epochsCompleted = 0;
     for (let epoch = 1; epoch <= maxEpochs; epoch += 1) {
       epochsCompleted = epoch;
       const temperature = 0.2 * (1 - epoch / maxEpochs) + 0.018;
-      for (let candidateIndex = 0; candidateIndex < 12; candidateIndex += 1) {
+      for (let candidateIndex = 0; candidateIndex < 10; candidateIndex += 1) {
         const raw = {
           trend: clamp(bestModel.trend + (Math.random() - 0.5) * temperature, 0.03, 0.78),
           rsi: clamp(bestModel.rsi + (Math.random() - 0.5) * temperature, 0.02, 0.52),
           momentum: clamp(bestModel.momentum + (Math.random() - 0.5) * temperature, 0.02, 0.62),
           volatility: clamp(bestModel.volatility + (Math.random() - 0.5) * temperature, 0.01, 0.34),
-          threshold: clamp(bestModel.threshold + (Math.random() - 0.5) * 0.055, 0.11, 0.46),
+          vwap: clamp(bestModel.vwap + (Math.random() - 0.5) * temperature, 0.02, 0.58),
+          volume: clamp(bestModel.volume + (Math.random() - 0.5) * temperature, 0.01, 0.38),
+          threshold: clamp(bestModel.threshold + (Math.random() - 0.5) * 0.04, 0.11, 0.34),
         };
-        const sum = raw.trend + raw.rsi + raw.momentum + raw.volatility;
+        const sum = raw.trend + raw.rsi + raw.momentum + raw.volatility + raw.vwap + raw.volume;
         const candidate: ModelWeights = {
           trend: raw.trend / sum,
           rsi: raw.rsi / sum,
           momentum: raw.momentum / sum,
           volatility: raw.volatility / sum,
+          vwap: raw.vwap / sum,
+          volume: raw.volume / sum,
           threshold: raw.threshold,
         };
         const candidateEvaluation = evaluateModel(filteredData, candidate);
@@ -1611,6 +1825,8 @@ export default function Home() {
     { label: "EMA trend", value: latestFactors.trend, weight: model.trend, color: "mint" },
     { label: "Momentum", value: latestFactors.momentum, weight: model.momentum, color: "amber" },
     { label: "RSI edge", value: latestFactors.rsi, weight: model.rsi, color: "violet" },
+    { label: "VWAP", value: latestFactors.vwap, weight: model.vwap, color: "blue" },
+    { label: "Volume", value: latestFactors.volume, weight: model.volume, color: "mint" },
     { label: "Volatility", value: latestFactors.volatility, weight: model.volatility, color: "blue" },
   ];
 
@@ -1622,6 +1838,18 @@ export default function Home() {
           <span>Signal <b>Forge</b></span>
           <em>SIM</em>
         </a>
+
+        <nav className="primary-nav" role="tablist" aria-label="Primary workspace">
+          <button id="tab-chart" role="tab" aria-selected={activeView === "chart"} aria-controls="panel-chart" className={activeView === "chart" ? "active" : ""} type="button" onClick={() => setActiveView("chart")}>
+            <BarChart3 size={15} /> <span>Backtest</span>
+          </button>
+          <button id="tab-train" role="tab" aria-selected={activeView === "train"} aria-controls="panel-train" className={activeView === "train" ? "active" : ""} type="button" onClick={() => setActiveView("train")}>
+            <BrainCircuit size={15} /> <span>Training</span>{training && <i className="nav-live-dot" />}
+          </button>
+          <button id="tab-paper" role="tab" aria-selected={activeView === "paper"} aria-controls="panel-paper" className={activeView === "paper" ? "active" : ""} type="button" onClick={() => setActiveView("paper")}>
+            <BriefcaseBusiness size={15} /> <span>Portfolio</span>{paperActive && <i className="nav-live-dot" />}
+          </button>
+        </nav>
 
         <div className="top-actions">
           <div className={`sync-pill ${syncStatus}`} title="Cloud checkpoint status">
@@ -1654,6 +1882,8 @@ export default function Home() {
       </header>
 
       <div className="dashboard refined-dashboard" id="workspace">
+        {activeView === "chart" && (
+          <>
         <section className="command-center">
           <div className="instrument-focus">
             <div className="ticker-logo">A</div>
@@ -1670,7 +1900,7 @@ export default function Home() {
                   {percent(dayMove, 2)}
                 </span>
               </div>
-              <p>Daily candles / Forge Policy v2 / long, short, or stay flat</p>
+              <p>30-minute candles / same-day long and short / flat by 4:00 PM</p>
             </div>
           </div>
 
@@ -1739,9 +1969,9 @@ export default function Home() {
                 <small>{money(result.finalValue)} final value</small>
               </div>
               <div className="outcome-item">
-                <span>Buy and hold</span>
-                <strong>{percent(result.buyHoldReturn)}</strong>
-                <small>Same stock, same dates</small>
+                <span>Day-trade frequency</span>
+                <strong>{result.tradesPerDay.toFixed(1)} / day</strong>
+                <small>{result.roundTrips} closed positions</small>
               </div>
               <div className="outcome-item">
                 <span>Excess return</span>
@@ -1756,58 +1986,19 @@ export default function Home() {
             </>
           )}
         </section>
-
-        <nav className="workspace-tabs" role="tablist" aria-label="Trading lab views">
-          <button
-            id="tab-chart"
-            role="tab"
-            aria-selected={activeView === "chart"}
-            aria-controls="panel-chart"
-            className={activeView === "chart" ? "active" : ""}
-            type="button"
-            onClick={() => setActiveView("chart")}
-          >
-            <BarChart3 size={17} />
-            <span><strong>Overview</strong><small>Chart, decisions, results</small></span>
-          </button>
-          <button
-            id="tab-train"
-            role="tab"
-            aria-selected={activeView === "train"}
-            aria-controls="panel-train"
-            className={activeView === "train" ? "active" : ""}
-            type="button"
-            onClick={() => setActiveView("train")}
-          >
-            <BrainCircuit size={17} />
-            <span><strong>Training</strong><small>Teacher, holdout, checkpoints</small></span>
-            {training && <i className="tab-live-dot" />}
-          </button>
-          <button
-            id="tab-paper"
-            role="tab"
-            aria-selected={activeView === "paper"}
-            aria-controls="panel-paper"
-            className={activeView === "paper" ? "active" : ""}
-            type="button"
-            onClick={() => setActiveView("paper")}
-          >
-            <BriefcaseBusiness size={17} />
-            <span><strong>Portfolio</strong><small>Positions, P&amp;L, orders</small></span>
-            {paperActive && <i className="tab-live-dot" />}
-          </button>
-        </nav>
+          </>
+        )}
 
         {activeView === "chart" && (
           <section className="panel focused-workspace chart-workspace" id="panel-chart" role="tabpanel" aria-labelledby="tab-chart">
             <div className="workspace-heading">
               <div>
-                <span className="view-kicker">BACKTEST REPLAY</span>
-                <h2>One timeline, every decision</h2>
-                <p>Price, causal inputs, long and short entries, and exits stay aligned.</p>
+                <span className="view-kicker">INTRADAY BACKTEST</span>
+                <h2>Day-trading replay</h2>
+                <p>Frequent same-day opportunities on 30-minute candles, with no overnight positions.</p>
               </div>
-              <div className="timeframe-control" role="group" aria-label="Chart viewport">
-                {(["ALL", "1Y", "6M", "3M"] as const).map((item) => (
+              {backtestTab === "chart" && <div className="timeframe-control" role="group" aria-label="Chart viewport">
+                {(["ALL", "1M", "2W", "5D"] as const).map((item) => (
                   <button
                     type="button"
                     key={item}
@@ -1817,11 +2008,18 @@ export default function Home() {
                     {item}
                   </button>
                 ))}
-              </div>
+              </div>}
             </div>
 
+            <nav className="page-subtabs" aria-label="Backtest sections">
+              <button className={backtestTab === "chart" ? "active" : ""} type="button" onClick={() => setBacktestTab("chart")}>Chart</button>
+              <button className={backtestTab === "performance" ? "active" : ""} type="button" onClick={() => setBacktestTab("performance")}>Performance</button>
+              <button className={backtestTab === "trades" ? "active" : ""} type="button" onClick={() => setBacktestTab("trades")}>Trades <span>{result.roundTrips}</span></button>
+            </nav>
+
+            {backtestTab === "chart" && <>
             <div className="chart-summary-line">
-              <span><Activity size={14} /> {filteredData.length} market sessions</span>
+              <span><Activity size={14} /> {sessionCount} days / {filteredData.length} intraday candles</span>
               <span><TrendingUp size={14} /> {result.longEntries} longs</span>
               <span><TrendingDown size={14} /> {result.shortEntries} shorts</span>
               <span><ShieldCheck size={14} /> Fees and slippage included</span>
@@ -1846,8 +2044,9 @@ export default function Home() {
                 See how the policy learns <ArrowUpRight size={14} />
               </button>
             </div>
+            </>}
 
-            <div className="below-chart-grid">
+            {backtestTab === "performance" && <div className="below-chart-grid performance-view">
               <article className="compact-equity">
                 <div className="compact-section-heading">
                   <div><span>Portfolio growth</span><strong>{money(result.finalValue)}</strong></div>
@@ -1867,13 +2066,14 @@ export default function Home() {
                 </p>
                 <div className="plain-stats">
                   <div><span>Winning exits</span><strong>{(result.winRate * 100).toFixed(0)}%</strong></div>
-                  <div><span>Closed positions</span><strong>{Math.floor(result.trades.length / 2)}</strong></div>
-                  <div><span>Risk score</span><strong>{result.sharpe.toFixed(2)}</strong></div>
+                  <div><span>Trades per day</span><strong>{result.tradesPerDay.toFixed(1)}</strong></div>
+                  <div><span>Average hold</span><strong>{Math.round(result.averageHoldBars * 30)}m</strong></div>
+                  <div><span>Closed positions</span><strong>{result.roundTrips}</strong></div>
                 </div>
               </article>
-            </div>
+            </div>}
 
-            <details className="trade-drawer">
+            {backtestTab === "trades" && <details className="trade-drawer" open>
               <summary>
                 <span><Layers3 size={16} /> Recent policy trades</span>
                 <small>{result.trades.length} orders in this backtest</small>
@@ -1882,9 +2082,9 @@ export default function Home() {
                 <table>
                   <thead><tr><th>Date</th><th>Action</th><th>Fill price</th><th>Shares</th><th>Profit / loss</th><th>Confidence</th><th>Why</th></tr></thead>
                   <tbody>
-                    {result.trades.slice().reverse().slice(0, 10).map((trade) => (
+                    {result.trades.slice().reverse().slice(0, 50).map((trade) => (
                       <tr key={trade.id}>
-                        <td>{dateLabel(trade.date)}</td>
+                        <td>{dateLabel(trade.date, trade.time)}</td>
                         <td><span className={trade.side === "BUY" || trade.side === "COVER" ? "side-tag buy" : "side-tag sell"}>{trade.side}</span></td>
                         <td>{money(trade.price, 2)}</td>
                         <td>{trade.shares}</td>
@@ -1896,7 +2096,7 @@ export default function Home() {
                   </tbody>
                 </table>
               </div>
-            </details>
+            </details>}
           </section>
         )}
 
@@ -1918,7 +2118,14 @@ export default function Home() {
                   </span>
                 </div>
 
-                <div className="training-layout">
+                <nav className="page-subtabs" aria-label="Training sections">
+                  <button className={trainingTab === "run" ? "active" : ""} type="button" onClick={() => setTrainingTab("run")}>Train</button>
+                  <button className={trainingTab === "checkpoints" ? "active" : ""} type="button" onClick={() => setTrainingTab("checkpoints")}>Checkpoints <span>{trainingRuns.length}</span></button>
+                  <button className={trainingTab === "policy" ? "active" : ""} type="button" onClick={() => setTrainingTab("policy")}>Policy</button>
+                </nav>
+
+                {(trainingTab === "run" || trainingTab === "policy") && <div className="training-layout single">
+                  {trainingTab === "run" &&
                   <article className="training-overview">
                     <div className="training-result-hero">
                       <div className="training-model-mark"><Cpu size={22} /></div>
@@ -1949,11 +2156,12 @@ export default function Home() {
                       Train another checkpoint
                     </button>
                     <small className="safe-note"><ShieldCheck size={13} /> Hindsight labels are training-only. They are never available to the paper bot.</small>
-                  </article>
+                  </article>}
 
+                  {trainingTab === "policy" &&
                   <article className="model-explanation">
                     <span className="view-kicker">CAUSAL POLICY</span>
-                    <h3>Four inputs, no future leakage</h3>
+                    <h3>Six inputs, no future leakage</h3>
                     <p>The teacher can see future prices, but the saved policy can only use indicators available on that candle.</p>
                     <div className="refined-factor-list">
                       {factors.map((factor) => {
@@ -1970,16 +2178,16 @@ export default function Home() {
                         );
                       })}
                     </div>
-                  </article>
-                </div>
+                  </article>}
+                </div>}
 
-                <div className="learning-grid">
+                {trainingTab === "policy" && <div className="learning-grid">
                   <article className="teacher-card">
                     <div className="teacher-card-icon"><GraduationCap size={21} /></div>
                     <div>
                       <span className="view-kicker">HINDSIGHT TEACHER</span>
                       <h3>Shows the best direction after the fact</h3>
-                      <p>For each training candle, the teacher labels the next four sessions as long, short, or flat. Those future-aware labels guide learning only.</p>
+                      <p>For each training candle, the teacher labels the next four intraday candles as long, short, or flat. Those future-aware labels guide learning only.</p>
                     </div>
                     <div className="teacher-score">
                       <span>Policy agreement</span>
@@ -1990,7 +2198,7 @@ export default function Home() {
                   <article className="split-card">
                     <div className="split-card-heading">
                       <div><BookOpenCheck size={17} /><span>Walk-forward split</span></div>
-                      <small>{filteredData.length} sessions</small>
+                      <small>{sessionCount} days / {filteredData.length} candles</small>
                     </div>
                     <div className="split-rail" aria-label="Training and holdout split">
                       <span style={{ width: `${filteredData.length ? trainingSplitCount / filteredData.length * 100 : 72}%` }}>Teacher training</span>
@@ -1998,9 +2206,9 @@ export default function Home() {
                     </div>
                     <p>The model studies the earlier period. The later period stays hidden until scoring, which reduces backtest overfitting.</p>
                   </article>
-                </div>
+                </div>}
 
-                <section className="training-history" aria-label="Saved training history">
+                {trainingTab === "checkpoints" && <section className="training-history standalone-history" aria-label="Saved training history">
                   <div className="training-history-heading">
                     <div><History size={17} /><span><strong>Checkpoint history</strong><small>Persisted to your account</small></span></div>
                     <span>{trainingRuns.filter((run) => run.improved).length} saved</span>
@@ -2019,14 +2227,14 @@ export default function Home() {
                       ))}
                     </div>
                   )}
-                </section>
+                </section>}
 
-                <div className="checkpoint-strip">
+                {trainingTab === "run" && <div className="checkpoint-strip">
                   <div><Gauge size={17} /><span><small>Policy confidence</small><strong>{result.confidence}%</strong></span></div>
                   <div><ShieldCheck size={17} /><span><small>Holdout drawdown</small><strong>{percent(validationResult.maxDrawdown)}</strong></span></div>
                   <div><Target size={17} /><span><small>Teacher agreement</small><strong>{(currentTeacherAgreement * 100).toFixed(0)}%</strong></span></div>
                   <button className="text-button" type="button" onClick={() => setActiveView("chart")}>View result on chart <ArrowUpRight size={14} /></button>
-                </div>
+                </div>}
               </>
             )}
           </section>
@@ -2043,8 +2251,16 @@ export default function Home() {
               <span className={paperActive ? "bot-state armed" : "bot-state"}><Radio size={12} /> {paperActive ? (marketClock.isOpen || replayMode ? "Running" : "Armed for open") : "Stopped"}</span>
             </div>
 
-            <div className="paper-layout">
+            <nav className="page-subtabs" aria-label="Portfolio sections">
+              <button className={portfolioTab === "account" ? "active" : ""} type="button" onClick={() => setPortfolioTab("account")}>Account</button>
+              <button className={portfolioTab === "orders" ? "active" : ""} type="button" onClick={() => setPortfolioTab("orders")}>Orders <span>{paper.orders.length}</span></button>
+              <button className={portfolioTab === "automation" ? "active" : ""} type="button" onClick={() => setPortfolioTab("automation")}>Automation</button>
+            </nav>
+
+            <div className="paper-layout single">
+              {portfolioTab !== "orders" &&
               <article className="paper-account-card">
+                {portfolioTab === "account" && <>
                 <div className="paper-account-top">
                   <div><span>Net liquidation value</span><strong>{money(paperValue, 2)}</strong><small className={`position-pill ${paperPosition.toLowerCase()}`}>{paperPosition}</small></div>
                   <div className={paperPnl >= 0 ? "paper-pnl positive" : "paper-pnl negative"}><span>Total result</span><strong>{percent(paperPnl / PAPER_STARTING_CASH, 2)}</strong><small>{money(paperPnl, 2)}</small></div>
@@ -2061,7 +2277,9 @@ export default function Home() {
                   <div><span>Portfolio history</span><small>{paper.equityHistory.length ? `${paper.equityHistory.length} saved marks` : "Starts when the bot runs"}</small></div>
                   <PortfolioChart history={paper.equityHistory} theme={theme} />
                 </div>
+                </>}
 
+                {portfolioTab === "automation" && <div className="automation-view">
                 <div className="paper-market-card">
                   <span className={marketClock.isOpen ? "paper-market-icon open" : "paper-market-icon"}><Clock3 size={18} /></span>
                   <div>
@@ -2082,8 +2300,16 @@ export default function Home() {
                   )}
                   <button className="secondary-button reset-paper" type="button" onClick={resetPaper}><RotateCcw size={15} /> Reset</button>
                 </div>
-              </article>
+                <div className="automation-rules">
+                  <div><span>Decision interval</span><strong>Every simulated 30m candle</strong></div>
+                  <div><span>Position policy</span><strong>Long / short / flat</strong></div>
+                  <div><span>Risk exits</span><strong>Target, stop, 2-candle time exit</strong></div>
+                  <div><span>Overnight risk</span><strong>Always flat by 4:00 PM</strong></div>
+                </div>
+                </div>}
+              </article>}
 
+              {portfolioTab === "orders" &&
               <aside className="paper-activity-card">
                 <div className="paper-activity-heading">
                   <div><span className="view-kicker">RECENT ACTIVITY</span><h3>Paper orders</h3></div>
@@ -2097,7 +2323,7 @@ export default function Home() {
                       <p>Start the simulator or replay a session to watch durable orders appear here.</p>
                     </div>
                   ) : (
-                    paper.orders.slice(0, 6).map((order) => (
+                    paper.orders.slice(0, 40).map((order) => (
                       <div className="paper-order" key={order.id}>
                         <span className={order.side === "BUY" || order.side === "COVER" ? "order-icon buy" : "order-icon sell"}>{order.side === "BUY" || order.side === "COVER" ? <ArrowUpRight size={15} /> : <ArrowDownRight size={15} />}</span>
                         <div><strong>{order.side} {order.shares} AAPL</strong><small>{order.note} / {order.time}</small></div>
@@ -2107,7 +2333,7 @@ export default function Home() {
                   )}
                 </div>
                 <div className="paper-disclosure"><Database size={14} /> Portfolio and order history are saved. Prices and fills remain simulated.</div>
-              </aside>
+              </aside>}
             </div>
           </section>
         )}
