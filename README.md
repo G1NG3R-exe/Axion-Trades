@@ -1,6 +1,6 @@
 # Signal Forge
 
-Signal Forge is an account-backed intraday trading research sandbox for one simulated AAPL-like instrument. It has an isolated training year, selectable out-of-sample backtests, a five-minute paper replay, long/short portfolio accounting, and a deliberately empty Live mode.
+Signal Forge is an account-backed intraday trading research sandbox for one simulated AAPL-like instrument. It has an isolated training year, selectable out-of-sample backtests, a five-minute paper replay, long/short portfolio accounting, a regime-aware four-strategy ensemble, and a deliberately empty Live mode.
 
 It is research software, not a broker. The tape is synthetic and the app cannot place real orders.
 
@@ -12,8 +12,11 @@ It is research software, not a broker. The tape is synthetic and the app cannot 
 - Backtest and Sandbox process 78 five-minute bars per regular session.
 - Signals are generated after a candle closes and fill at the next candle open.
 - Both paths share the score, entry, execution-cost, position-risk, cooldown, daily-loss-lock, and 4:00 PM liquidation rules.
+- The policy combines trend following, momentum, mean reversion, and volume-confirmed breakouts using EMA 9/21/50, MACD, RSI, ADX, VWAP, Bollinger Bands, ORB, key levels, and OBV flow.
+- Planned stop risk is capped at 0.5% of current equity ($5 per $1,000), entries can use up to 97% of available buying power, and a session allows at most 14 entries. Stop execution can exceed the planned loss through gaps and slippage.
+- A stopped trade pauses for one completed bar and then the policy can trade again. A separate 2% session-level decline locks new entries for the day.
 
-The simulator models a dynamic bid/ask spread, participation-based slippage, SEC sale fees, FINRA TAF, and a CAT fee. It does not model taxes, stock-borrow availability, hard-to-borrow charges, halts, queue position, or partial fills.
+The simulator models a dynamic bid/ask spread, participation-based slippage, SEC sale fees, FINRA TAF, and a CAT fee. It does not model taxes, stock-borrow availability, hard-to-borrow charges, halts, queue position, or partial fills. It is not evidence that the policy will make money and must not be funded with borrowed or family money.
 
 ## Accounts
 

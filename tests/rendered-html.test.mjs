@@ -18,12 +18,12 @@ test("builds the complete Signal Forge application", async () => {
   ]);
 
   assert.match(layout, /Persistent Trading Research Lab/);
-  assert.match(page, /Forge Policy v2/);
+  assert.match(page, /Forge Policy v3/);
   assert.match(page, /HINDSIGHT TEACHER/);
   assert.match(page, /Unseen holdout/);
   assert.match(page, /Portfolio history/);
   assert.match(page, /Switch to.*mode/);
-  assert.match(page, /Five-minute ensemble/);
+  assert.match(page, /Five-minute multi-strategy ensemble/);
   assert.match(page, /flat by 4:00 PM/i);
   assert.match(page, /intradayEntryThreshold/);
   assert.match(page, /tradesPerDay/);
@@ -36,6 +36,10 @@ test("builds the complete Signal Forge application", async () => {
   assert.match(page, /Opening range breakout/);
   assert.match(page, /VWAP \/ EMA pullback/);
   assert.match(page, /Bollinger squeeze/);
+  assert.match(page, /Mean reversion/);
+  assert.match(page, /Volume breakout/);
+  assert.match(page, /EMA 9 \/ 21 \/ 50/);
+  assert.match(page, /OBV flow/);
   assert.match(page, /ATR risk stop/);
   assert.match(page, /positiveWeekRate/);
   assert.match(page, /function migrateModel/);
@@ -99,7 +103,11 @@ test("uses one realistic five-minute executor for backtest and paper", async () 
 
   assert.match(page, /const BAR_MINUTES = 5/);
   assert.match(page, /const BARS_PER_SESSION = 78/);
+  assert.match(page, /const MAX_ENTRIES_PER_SESSION = 14/);
+  assert.match(page, /const RISK_PER_TRADE_FRACTION = 0\.005/);
+  assert.match(page, /const DAILY_LOSS_LIMIT_FRACTION = 0\.02/);
   assert.match(page, /function pendingEntryForBar/);
+  assert.match(page, /function entryRiskPlan/);
   assert.match(page, /function executionFill/);
   assert.match(page, /function advancePaperAccount/);
   assert.match(page, /advancePaperAccount\(account, bar, model\)/);
@@ -107,5 +115,6 @@ test("uses one realistic five-minute executor for backtest and paper", async () 
   assert.match(page, /const SEC_FEE_RATE = 20\.6/);
   assert.match(page, /const FINRA_TAF_PER_SHARE = 0\.000195/);
   assert.match(page, /totalSlippage/);
+  assert.match(page, /pnl < 0 \? LOSS_COOLDOWN_BARS : 0/);
   assert.doesNotMatch(page, /window\.localStorage/);
 });
