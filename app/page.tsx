@@ -2283,7 +2283,7 @@ function normalizePersistedState(value: unknown): PersistedLabState | null {
   const savedVersion = Math.trunc(finiteNumber(state.version, 1));
   return {
     version: STATE_VERSION,
-    theme: state.theme === "light" || state.theme === "dark" ? state.theme : "dark",
+    theme: state.theme === "light" || state.theme === "dark" ? state.theme : "light",
     model: migrateModel(state.model, savedVersion),
     trainingEpoch: Math.max(0, Math.trunc(finiteNumber(state.trainingEpoch, 1840))),
     trainingRuns: Array.isArray(state.trainingRuns) ? state.trainingRuns.slice(0, 40) : [],
@@ -2308,7 +2308,7 @@ export default function Home() {
   const [backtestTab, setBacktestTab] = useState<"chart" | "performance" | "trades">("chart");
   const [trainingTab, setTrainingTab] = useState<"run" | "checkpoints" | "policy">("run");
   const [portfolioTab, setPortfolioTab] = useState<"account" | "orders" | "automation">("account");
-  const [theme, setTheme] = useState<"light" | "dark">("dark");
+  const [theme, setTheme] = useState<"light" | "dark">("light");
   const [themeReady, setThemeReady] = useState(false);
   const [model, setModel] = useState(INITIAL_MODEL);
   const [isRunning, setIsRunning] = useState(false);
@@ -2378,8 +2378,7 @@ export default function Home() {
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
-      const nextTheme = window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
-      setTheme(nextTheme);
+      setTheme("light");
       setThemeReady(true);
     }, 0);
     return () => window.clearTimeout(timer);
@@ -2977,11 +2976,11 @@ export default function Home() {
             </div>
             <label className="auth-field" htmlFor="auth-username">
               <span>Username</span>
-              <input id="auth-username" name="username" autoComplete="username" minLength={3} maxLength={24} pattern="[A-Za-z0-9][A-Za-z0-9_-]{2,23}" required value={authUsername} onChange={(event) => setAuthUsername(event.target.value)} placeholder="your_username" />
+              <input id="auth-username" name="username" autoComplete="username" minLength={3} maxLength={24} pattern={"[A-Za-z0-9](?:[A-Za-z0-9_]|-){2,23}"} required value={authUsername} onChange={(event) => setAuthUsername(event.target.value)} placeholder="your_username" />
             </label>
             <label className="auth-field" htmlFor="auth-password">
               <span>Password</span>
-              <input id="auth-password" name="password" type="password" autoComplete={authMode === "login" ? "current-password" : "new-password"} minLength={10} maxLength={128} required value={authPassword} onChange={(event) => setAuthPassword(event.target.value)} placeholder="10+ characters" />
+              <input id="auth-password" name="password" type="password" autoComplete={authMode === "login" ? "current-password" : "new-password"} minLength={8} maxLength={128} required value={authPassword} onChange={(event) => setAuthPassword(event.target.value)} placeholder="8+ characters" />
             </label>
             {authError && <div className="auth-error" role="alert"><Info size={14} /> {authError}</div>}
             <button className="primary-button auth-submit" type="submit" disabled={authBusy}>

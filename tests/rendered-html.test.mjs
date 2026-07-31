@@ -11,9 +11,10 @@ async function source(path) {
 test("builds the complete Signal Forge application", async () => {
   await access(new URL("../dist/server/index.js", import.meta.url));
 
-  const [page, layout] = await Promise.all([
+  const [page, layout, styles] = await Promise.all([
     source("app/page.tsx"),
     source("app/layout.tsx"),
+    source("app/globals.css"),
   ]);
 
   assert.match(layout, /Persistent Trading Research Lab/);
@@ -38,16 +39,26 @@ test("builds the complete Signal Forge application", async () => {
   assert.match(page, /ATR risk stop/);
   assert.match(page, /positiveWeekRate/);
   assert.match(page, /function migrateModel/);
+  assert.match(page, /minLength=\{8\}/);
+  assert.match(page, /8\+ characters/);
+  assert.match(page, /\[A-Za-z0-9\]\(\?:\[A-Za-z0-9_\]\|-\)\{2,23\}/);
+  assert.match(page, /setTheme\("light"\)/);
+  assert.match(layout, /data-theme="light"/);
+  assert.match(layout, /og-liquid\.png/);
+  assert.doesNotMatch(layout, /next\/font/);
+  assert.match(styles, /light-first liquid glass/);
+  assert.match(styles, /backdrop-filter: blur\(28px\) saturate\(165%\)/);
   assert.doesNotMatch(page, /SkeletonPreview/);
 });
 
 test("includes durable per-user checkpoint storage", async () => {
-  const [route, schema, hosting, migration, auth] = await Promise.all([
+  const [route, schema, hosting, migration, auth, database] = await Promise.all([
     source("app/api/state/route.ts"),
     source("db/schema.ts"),
     source(".openai/hosting.json"),
     source("drizzle/0001_lethal_morlocks.sql"),
     source("app/account-auth.ts"),
+    source("db/index.ts"),
   ]);
 
   assert.match(hosting, /"d1": "DB"/);
@@ -61,8 +72,11 @@ test("includes durable per-user checkpoint storage", async () => {
   assert.match(migration, /CREATE TABLE `account_sessions`/);
   assert.match(migration, /CREATE TABLE `account_states`/);
   assert.match(auth, /PASSWORD_ITERATIONS = 600_000/);
+  assert.match(auth, /password.length < 8/);
   assert.match(auth, /HttpOnly; SameSite=Strict/);
   assert.match(auth, /authRateLimited/);
+  assert.match(database, /ensureAccountSchema/);
+  assert.match(database, /CREATE TABLE IF NOT EXISTS accounts/);
 });
 
 test("keeps future-aware labels out of the live policy", async () => {

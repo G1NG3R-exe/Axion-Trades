@@ -48,7 +48,8 @@ export async function POST(request: Request) {
       { user },
       { status: 201, headers: { "set-cookie": session.cookie } },
     );
-  } catch {
+  } catch (error) {
+    console.error("Signal Forge registration failed", error);
     return noStoreJson({ error: "The account service is temporarily unavailable." }, { status: 503 });
   }
 }
