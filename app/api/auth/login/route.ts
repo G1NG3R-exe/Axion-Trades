@@ -11,12 +11,10 @@ import {
   verifyPassword,
 } from "../../../account-auth";
 import { getD1 } from "../../../../db";
-import { proxySitesRequest, usesSitesProxy } from "../../sites-proxy";
 
 export const dynamic = "force-dynamic";
 
 export async function POST(request: Request) {
-  if (usesSitesProxy()) return proxySitesRequest(request);
   if (!isTrustedWrite(request)) return noStoreJson({ error: "Request origin was rejected." }, { status: 403 });
 
   try {
@@ -55,8 +53,7 @@ export async function POST(request: Request) {
     const user = { id: row.id, username: row.username };
     const session = await createSession(request, user);
     return noStoreJson({ user }, { headers: { "set-cookie": session.cookie } });
-  } catch (error) {
-    console.error("axion-trades login failed", error);
+  } catch {
     return noStoreJson({ error: "The account service is temporarily unavailable." }, { status: 503 });
   }
 }

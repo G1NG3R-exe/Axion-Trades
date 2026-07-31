@@ -1,113 +1,80 @@
-import { eq, sql } from "drizzle-orm";
-import { getChatGPTUser } from "../../chatgpt-auth";
-import { getDb } from "../../../db";
-import { tradingStates } from "../../../db/schema";
+import { getAccountSession, isTrustedWrite, noStoreJson } from "../../account-auth";
+import { getD1 } from "../../../db";
 
 export const dynamic = "force-dynamic";
 
 const MAX_STATE_BYTES = 300_000;
 
-async function resolveUserEmail(request: Request) {
-  const user = await getChatGPTUser();
-  if (user?.email) return user.email.toLowerCase();
-
-  const hostname = new URL(request.url).hostname;
-  if (hostname === "localhost" || hostname === "127.0.0.1") {
-    return "local-preview@signalforge.dev";
-  }
-
-  return null;
-}
-
 function routeError(error: unknown) {
   const message = error instanceof Error ? error.message : "Unexpected error";
-  if (message.includes("no such table") || message.includes("trading_states")) {
-    return "Persistent storage is still initializing. Try again in a moment.";
+  if (message.includes("no such table") || message.includes("account_states")) {
+    return "Account storage is still initializing. Try again in a moment.";
   }
-  return "The lab could not reach persistent storage.";
+  return "The lab could not reach account storage.";
 }
 
 export async function GET(request: Request) {
-  const userEmail = await resolveUserEmail(request);
-  if (!userEmail) {
-    return Response.json({ error: "Sign in is required." }, { status: 401 });
-  }
-
   try {
-    const db = getDb();
-    const [row] = await db
-      .select()
-      .from(tradingStates)
-      .where(eq(tradingStates.userEmail, userEmail))
-      .limit(1);
-
-    if (!row) {
-      return Response.json({ state: null, revision: 0 });
-    }
-
-    return Response.json({
+    const session = await getAccountSession(request);
+    if (!session) return noStoreJson({ error: "Sign in is required." }, { status: 401 });
+    const row = await getD1()
+      .prepare("SELECT payload, revision, updated_at FROM account_states WHERE account_id = ? LIMIT 1")
+      .bind(session.user.id)
+      .first<{ payload: string; revision: number; updated_at: string }>();
+    if (!row) return noStoreJson({ state: null, revision: 0 });
+    return noStoreJson({
       state: JSON.parse(row.payload),
       revision: row.revision,
-      updatedAt: row.updatedAt,
+      updatedAt: row.updated_at,
     });
   } catch (error) {
-    return Response.json({ error: routeError(error) }, { status: 500 });
+    return noStoreJson({ error: routeError(error) }, { status: 500 });
   }
 }
 
 export async function PUT(request: Request) {
-  const userEmail = await resolveUserEmail(request);
-  if (!userEmail) {
-    return Response.json({ error: "Sign in is required." }, { status: 401 });
-  }
-
+  if (!isTrustedWrite(request)) return noStoreJson({ error: "Request origin was rejected." }, { status: 403 });
   try {
+    const session = await getAccountSession(request);
+    if (!session) return noStoreJson({ error: "Sign in is required." }, { status: 401 });
     const body = (await request.json()) as { state?: unknown };
     if (!body.state || typeof body.state !== "object") {
-      return Response.json({ error: "A valid state object is required." }, { status: 400 });
+      return noStoreJson({ error: "A valid state object is required." }, { status: 400 });
     }
-
     const payload = JSON.stringify(body.state);
     if (new TextEncoder().encode(payload).byteLength > MAX_STATE_BYTES) {
-      return Response.json({ error: "Saved state is too large." }, { status: 413 });
+      return noStoreJson({ error: "Saved state is too large." }, { status: 413 });
     }
-
-    const db = getDb();
-    await db
-      .insert(tradingStates)
-      .values({ userEmail, payload })
-      .onConflictDoUpdate({
-        target: tradingStates.userEmail,
-        set: {
-          payload,
-          revision: sql`${tradingStates.revision} + 1`,
-          updatedAt: sql`CURRENT_TIMESTAMP`,
-        },
-      });
-
-    const [saved] = await db
-      .select({ revision: tradingStates.revision, updatedAt: tradingStates.updatedAt })
-      .from(tradingStates)
-      .where(eq(tradingStates.userEmail, userEmail))
-      .limit(1);
-
-    return Response.json({ saved: true, ...saved });
+    const d1 = getD1();
+    await d1
+      .prepare(
+        `INSERT INTO account_states (account_id, payload)
+         VALUES (?, ?)
+         ON CONFLICT(account_id) DO UPDATE SET
+           payload = excluded.payload,
+           revision = account_states.revision + 1,
+           updated_at = CURRENT_TIMESTAMP`,
+      )
+      .bind(session.user.id, payload)
+      .run();
+    const saved = await d1
+      .prepare("SELECT revision, updated_at FROM account_states WHERE account_id = ? LIMIT 1")
+      .bind(session.user.id)
+      .first<{ revision: number; updated_at: string }>();
+    return noStoreJson({ saved: true, revision: saved?.revision ?? 1, updatedAt: saved?.updated_at });
   } catch (error) {
-    return Response.json({ error: routeError(error) }, { status: 500 });
+    return noStoreJson({ error: routeError(error) }, { status: 500 });
   }
 }
 
 export async function DELETE(request: Request) {
-  const userEmail = await resolveUserEmail(request);
-  if (!userEmail) {
-    return Response.json({ error: "Sign in is required." }, { status: 401 });
-  }
-
+  if (!isTrustedWrite(request)) return noStoreJson({ error: "Request origin was rejected." }, { status: 403 });
   try {
-    const db = getDb();
-    await db.delete(tradingStates).where(eq(tradingStates.userEmail, userEmail));
-    return Response.json({ deleted: true });
+    const session = await getAccountSession(request);
+    if (!session) return noStoreJson({ error: "Sign in is required." }, { status: 401 });
+    await getD1().prepare("DELETE FROM account_states WHERE account_id = ?").bind(session.user.id).run();
+    return noStoreJson({ deleted: true });
   } catch (error) {
-    return Response.json({ error: routeError(error) }, { status: 500 });
+    return noStoreJson({ error: routeError(error) }, { status: 500 });
   }
 }

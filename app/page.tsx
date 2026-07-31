@@ -15,11 +15,14 @@ import {
   Clock3,
   Cpu,
   Database,
+  FlaskConical,
   Gauge,
   GraduationCap,
   History,
   Info,
   Layers3,
+  LockKeyhole,
+  LogOut,
   Moon,
   Pause,
   Play,
@@ -33,9 +36,11 @@ import {
   Trophy,
   TrendingDown,
   TrendingUp,
+  UserRound,
   Zap,
 } from "lucide-react";
 import {
+  type FormEvent,
   useCallback,
   useEffect,
   useMemo,
@@ -98,16 +103,34 @@ type ModelWeights = {
 };
 
 type Position = "LONG" | "SHORT" | "FLAT";
+type TradeSide = "BUY" | "SELL" | "SHORT" | "COVER";
+type WorkspaceMode = "sandbox" | "live" | null;
+type AccountUser = { id: string; username: string };
+
+type PendingEntry = {
+  side: "LONG" | "SHORT";
+  setup: string;
+  confidence: number;
+  stopAtr: number;
+  rewardRisk: number;
+  maxHoldBars: number;
+  reason: string;
+  signalPrice: number;
+  signalAtr: number;
+  signalTimestamp: string;
+};
 
 type Trade = {
   id: string;
   date: string;
   time: string;
   timestamp: string;
-  side: "BUY" | "SELL" | "SHORT" | "COVER";
+  side: TradeSide;
   price: number;
   shares: number;
   value: number;
+  fees: number;
+  slippage: number;
   pnl: number | null;
   confidence: number;
   reason: string;
@@ -134,14 +157,19 @@ type BacktestResult = {
   averageHoldBars: number;
   averageWeekReturn: number;
   positiveWeekRate: number;
+  totalFees: number;
+  totalSlippage: number;
+  averageSpread: number;
 };
 
 type PaperOrder = {
   id: string;
   time: string;
-  side: "BUY" | "SELL" | "SHORT" | "COVER";
+  side: TradeSide;
   shares: number;
   price: number;
+  fees: number;
+  slippage: number;
   note: string;
 };
 
@@ -153,6 +181,18 @@ type PaperAccount = {
   stopPrice: number;
   targetPrice: number;
   entrySetup: string;
+  entryFees: number;
+  entrySlippage: number;
+  entryRisk: number;
+  barsHeld: number;
+  maxHoldBars: number;
+  pendingEntry: PendingEntry | null;
+  currentSession: string;
+  entriesThisSession: number;
+  cooldownBars: number;
+  dailyStartEquity: number;
+  dailyLocked: boolean;
+  lastBarTimestamp: string;
   realized: number;
   orders: PaperOrder[];
   equityHistory: Array<{ time: string; value: number }>;
@@ -172,7 +212,8 @@ type TrainingRun = {
 };
 
 type PersistedLabState = {
-  version: 4;
+  version: 5;
+  theme: "light" | "dark";
   model: ModelWeights;
   trainingEpoch: number;
   trainingRuns: TrainingRun[];
@@ -182,11 +223,23 @@ type PersistedLabState = {
 
 const STARTING_CAPITAL = 10_000;
 const PAPER_STARTING_CASH = 25_000;
-const DATA_START = "2020-01-02";
+const TRAINING_START = "2023-01-02";
+const TRAINING_END = "2023-12-29";
+const DATA_START = TRAINING_START;
 const DATA_END = "2026-07-29";
+const BACKTEST_MIN = "2024-01-02";
 const DEFAULT_START = "2024-01-02";
 const DEFAULT_END = "2025-12-31";
-const STATE_VERSION = 4;
+const STATE_VERSION = 5;
+const BAR_MINUTES = 5;
+const BARS_PER_SESSION = 78;
+const OPENING_RANGE_BARS = 3;
+const LAST_ENTRY_BAR = 72;
+const MAX_ENTRIES_PER_SESSION = 8;
+const SEC_FEE_RATE = 20.6 / 1_000_000;
+const FINRA_TAF_PER_SHARE = 0.000195;
+const FINRA_TAF_MAX = 9.79;
+const CAT_FEE_PER_SHARE = 0.000003;
 
 const INITIAL_MODEL: ModelWeights = {
   trend: 0.16,
@@ -211,6 +264,18 @@ const INITIAL_PAPER: PaperAccount = {
   stopPrice: 0,
   targetPrice: 0,
   entrySetup: "",
+  entryFees: 0,
+  entrySlippage: 0,
+  entryRisk: 0,
+  barsHeld: 0,
+  maxHoldBars: 9,
+  pendingEntry: null,
+  currentSession: "",
+  entriesThisSession: 0,
+  cooldownBars: 0,
+  dailyStartEquity: PAPER_STARTING_CASH,
+  dailyLocked: false,
+  lastBarTimestamp: "",
   realized: 0,
   orders: [],
   equityHistory: [],
@@ -235,6 +300,49 @@ const compact = (value: number) =>
     notation: "compact",
     maximumFractionDigits: 1,
   }).format(value);
+
+type FillKind = "market" | "stop" | "limit";
+
+function regulatoryFees(side: TradeSide, shares: number, price: number) {
+  const sale = side === "SELL" || side === "SHORT";
+  const secFee = sale ? shares * price * SEC_FEE_RATE : 0;
+  const tafFee = sale ? Math.min(FINRA_TAF_MAX, shares * FINRA_TAF_PER_SHARE) : 0;
+  const catFee = shares * CAT_FEE_PER_SHARE;
+  return secFee + tafFee + catFee;
+}
+
+function estimatedSpread(bar: MarketBar, referencePrice = bar.close) {
+  const edgeOfSession = bar.barInSession < 3 || bar.barInSession > 73 ? 1.35 : 1;
+  const volumePenalty = clamp(1.08 - bar.volumeRatio, 0, 1) * 0.42;
+  const volatilityPenalty = clamp(bar.rangeExpansion - 0.9, 0, 2.5) * 0.12;
+  const spreadBps = (0.42 + volumePenalty + volatilityPenalty) * edgeOfSession;
+  return Math.max(0.01, referencePrice * spreadBps / 10_000);
+}
+
+function executionFill(
+  bar: MarketBar,
+  side: TradeSide,
+  referencePrice: number,
+  shares: number,
+  kind: FillKind = "market",
+) {
+  const spread = estimatedSpread(bar, referencePrice);
+  const participation = shares / Math.max(1, bar.volume);
+  const impactBps = kind === "limit"
+    ? 0
+    : clamp(0.03 + Math.sqrt(participation) * 6 + Math.max(0, bar.rangeExpansion - 1) * 0.05, 0.03, 3.5);
+  const adversePerShare = kind === "limit"
+    ? 0
+    : spread / 2 + referencePrice * impactBps / 10_000;
+  const paysUp = side === "BUY" || side === "COVER";
+  const price = Math.max(0.01, referencePrice + (paysUp ? adversePerShare : -adversePerShare));
+  return {
+    price,
+    fees: regulatoryFees(side, shares, price),
+    slippage: Math.abs(price - referencePrice) * shares,
+    spread,
+  };
+}
 
 const seededRandom = (seed: number) => {
   let state = seed >>> 0;
@@ -308,56 +416,56 @@ function generateMarketData(): MarketBar[] {
       const sessionOpen = previousClose * (1 + gap);
       let intradayPrice = sessionOpen;
 
-      for (let barInSession = 0; barInSession < 13; barInSession += 1) {
-        const totalMinutes = 570 + barInSession * 30;
+      for (let barInSession = 0; barInSession < BARS_PER_SESSION; barInSession += 1) {
+        const totalMinutes = 570 + barInSession * BAR_MINUTES;
         const hour = Math.floor(totalMinutes / 60);
         const minute = totalMinutes % 60;
         const time = `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
         const open = intradayPrice;
-        const progress = barInSession / 12;
-        const openingPulse = barInSession < 2
-          ? direction * (0.00065 + random() * 0.0011) + (random() - 0.5) * 0.0028
+        const progress = barInSession / (BARS_PER_SESSION - 1);
+        const openingPulse = barInSession < 6
+          ? direction * (0.00012 + random() * 0.0002) + (random() - 0.5) * 0.0009
           : 0;
-        const closingPulse = barInSession > 10 ? (random() - 0.5) * 0.0032 : 0;
-        const microWave = Math.sin(session * 0.7 + barInSession * 1.35) * (regime === "range" ? 0.00165 : 0.0007);
-        const noiseScale = regime === "squeeze" && barInSession < 4 ? 0.0018 : 0.0042;
-        const microNoise = (random() - 0.5) * (noiseScale - Math.min(progress, 1 - progress) * 0.0011);
-        const meanReversion = ((sessionOpen - open) / sessionOpen) * (regime === "range" ? 0.11 : 0.028);
+        const closingPulse = barInSession > 73 ? (random() - 0.5) * 0.00115 : 0;
+        const microWave = Math.sin(session * 0.7 + barInSession * 0.23) * (regime === "range" ? 0.00052 : 0.00023);
+        const noiseScale = regime === "squeeze" && barInSession < 18 ? 0.00056 : 0.00142;
+        const microNoise = (random() - 0.5) * (noiseScale - Math.min(progress, 1 - progress) * 0.00034);
+        const meanReversion = ((sessionOpen - open) / sessionOpen) * (regime === "range" ? 0.024 : 0.006);
         let structure = 0;
         if (regime === "trend") {
-          structure = direction * 0.00048;
-          if (barInSession === 3 || barInSession === 7) structure -= direction * 0.00225;
-          if (barInSession === 4 || barInSession === 8) structure += direction * 0.0014;
+          structure = direction * 0.00008;
+          if (barInSession === 18 || barInSession === 50) structure -= direction * 0.00075;
+          if (barInSession === 20 || barInSession === 52) structure += direction * 0.00048;
         } else if (regime === "reversal") {
-          structure = barInSession < 2
-            ? -direction * 0.0019
-            : barInSession < 9
-              ? direction * 0.00105
-              : direction * 0.00025;
+          structure = barInSession < 12
+            ? -direction * 0.00034
+            : barInSession < 60
+              ? direction * 0.00018
+              : direction * 0.00004;
         } else if (regime === "squeeze") {
-          structure = barInSession < 3
-            ? -((open - sessionOpen) / sessionOpen) * 0.18
-            : barInSession === 3
-              ? direction * 0.0048
-              : direction * 0.00062;
+          structure = barInSession < 18
+            ? -((open - sessionOpen) / sessionOpen) * 0.035
+            : barInSession === 18
+              ? direction * 0.0017
+              : direction * 0.0001;
         } else {
-          structure = -((open - sessionOpen) / sessionOpen) * 0.08;
+          structure = -((open - sessionOpen) / sessionOpen) * 0.018;
         }
-        const driftShare = regime === "range" ? sessionReturn / 26 : sessionReturn / 16;
+        const driftShare = regime === "range" ? sessionReturn / 156 : sessionReturn / 96;
         const barReturn = driftShare + structure + openingPulse + closingPulse + microWave + microNoise + meanReversion;
         const close = Math.max(18, open * (1 + barReturn));
-        const range = 0.0012 + random() * 0.0031;
+        const range = 0.00038 + random() * 0.00108;
         const high = Math.max(open, close) * (1 + range * (0.35 + random() * 0.6));
         const low = Math.min(open, close) * (1 - range * (0.35 + random() * 0.6));
         const uShape = Math.pow(Math.abs(progress - 0.5) * 2, 1.5);
         const catalystVolume =
-          (regime === "trend" && barInSession < 2) ||
-          (regime === "squeeze" && barInSession === 3) ||
-          (regime === "reversal" && barInSession === 2)
+          (regime === "trend" && barInSession < 6) ||
+          (regime === "squeeze" && barInSession === 18) ||
+          (regime === "reversal" && barInSession === 12)
             ? 1.45
             : 1;
         const volume = Math.round(
-          1_900_000 * (0.82 + uShape * 2.1) * (0.72 + random() * 0.72) * (1 + Math.abs(barReturn) * 42) * catalystVolume,
+          320_000 * (0.82 + uShape * 2.1) * (0.72 + random() * 0.72) * (1 + Math.abs(barReturn) * 105) * catalystVolume,
         );
 
         raw.push({
@@ -475,22 +583,22 @@ function generateMarketData(): MarketBar[] {
     }
     const sessionHighBefore = runningSessionHigh;
     const sessionLowBefore = runningSessionLow;
-    if (bar.barInSession === 0) {
-      openingHigh = bar.high;
-      openingLow = bar.low;
+    if (bar.barInSession < OPENING_RANGE_BARS) {
+      openingHigh = bar.barInSession === 0 ? bar.high : Math.max(openingHigh, bar.high);
+      openingLow = bar.barInSession === 0 ? bar.low : Math.min(openingLow, bar.low);
     }
     const typical = (bar.high + bar.low + bar.close) / 3;
     cumulativeTypicalVolume += typical * bar.volume;
     cumulativeVolume += bar.volume;
-    const volumeWindow = raw.slice(Math.max(0, index - 26), index);
+    const volumeWindow = raw.slice(Math.max(0, index - BARS_PER_SESSION), index);
     const averageVolume = volumeWindow.length
       ? volumeWindow.reduce((sum, value) => sum + value.volume, 0) / volumeWindow.length
       : bar.volume;
-    const rollingWindow = raw.slice(Math.max(0, index - 26), index);
+    const rollingWindow = raw.slice(Math.max(0, index - BARS_PER_SESSION), index);
     const rollingHigh = rollingWindow.length ? Math.max(...rollingWindow.map((value) => value.high)) : bar.high;
     const rollingLow = rollingWindow.length ? Math.min(...rollingWindow.map((value) => value.low)) : bar.low;
     const bandWidth = mean === 0 ? 0 : (deviation * 4) / mean;
-    const priorBandWidths = bandWidths.slice(Math.max(0, bandWidths.length - 26));
+    const priorBandWidths = bandWidths.slice(Math.max(0, bandWidths.length - BARS_PER_SESSION));
     const averageBandWidth = priorBandWidths.length
       ? priorBandWidths.reduce((sum, value) => sum + value, 0) / priorBandWidths.length
       : Math.max(0.0001, bandWidth);
@@ -537,6 +645,11 @@ function generateMarketData(): MarketBar[] {
 }
 
 const MARKET_DATA = generateMarketData();
+const TRAINING_DATA = MARKET_DATA.filter(
+  (bar) => bar.date >= TRAINING_START && bar.date <= TRAINING_END,
+);
+const PAPER_SESSION_DATE = MARKET_DATA[MARKET_DATA.length - 1]?.date ?? DATA_END;
+const PAPER_STREAM = MARKET_DATA.filter((bar) => bar.date === PAPER_SESSION_DATE);
 
 function scoreBar(bar: MarketBar, weights: ModelWeights, explain = true) {
   const atrUnit = Math.max(bar.atr, bar.close * 0.0015);
@@ -561,7 +674,7 @@ function scoreBar(bar: MarketBar, weights: ModelWeights, explain = true) {
   const volume = clamp(bar.bodyStrength * Math.max(0, bar.volumeRatio - 0.62) * 0.78, -1, 1);
 
   let orb = 0;
-  if (bar.barInSession >= 1 && bar.barInSession <= 7) {
+  if (bar.barInSession >= OPENING_RANGE_BARS && bar.barInSession <= 18) {
     if (bar.close > bar.openingHigh) {
       orb = clamp(
         (bar.close - bar.openingHigh) / atrUnit * 0.82 + bar.closeLocation * 0.24 + Math.max(0, bar.volumeRatio - 1) * 0.2,
@@ -689,6 +802,47 @@ function intradayEntryThreshold(weights: ModelWeights) {
   return clamp(weights.threshold * 0.75, 0.14, 0.24);
 }
 
+function pendingEntryForBar(
+  bar: MarketBar,
+  weights: ModelWeights,
+  scored: ReturnType<typeof scoreBar>,
+): PendingEntry | null {
+  if (
+    bar.barInSession < OPENING_RANGE_BARS - 1 ||
+    bar.barInSession >= LAST_ENTRY_BAR ||
+    bar.volumeRatio <= 0.55 ||
+    scored.confluence < (bar.volumeRatio >= 1.15 ? 2 : 3) ||
+    !(
+      Math.abs(scored.factors.orb) >= 0.2 ||
+      Math.abs(scored.factors.pullback) >= 0.2 ||
+      Math.abs(scored.factors.squeeze) >= 0.16 ||
+      Math.abs(scored.factors.levels) >= 0.3 ||
+      scored.confluence >= 5
+    )
+  ) return null;
+
+  const threshold = intradayEntryThreshold(weights);
+  const dynamicThreshold = threshold * (bar.barInSession >= 66 ? 1.06 : 1);
+  const side = scored.score > dynamicThreshold
+    ? "LONG"
+    : scored.score < -dynamicThreshold
+      ? "SHORT"
+      : null;
+  if (!side) return null;
+  return {
+    side,
+    setup: scored.setup,
+    confidence: Math.round(clamp(48 + Math.abs(scored.score) * 35 + scored.confluence * 3.2, 50, 98)),
+    stopAtr: scored.stopAtr,
+    rewardRisk: scored.rewardRisk,
+    maxHoldBars: scored.regime === "TREND" ? 12 : scored.regime === "SQUEEZE" ? 9 : 6,
+    reason: `${scored.setup} / ${scored.regime.toLowerCase()} / ${scored.confluence} confirmations`,
+    signalPrice: bar.close,
+    signalAtr: bar.atr,
+    signalTimestamp: bar.timestamp,
+  };
+}
+
 
 function runBacktest(
   data: MarketBar[],
@@ -719,6 +873,9 @@ function runBacktest(
       averageHoldBars: 0,
       averageWeekReturn: 0,
       positiveWeekRate: 0,
+      totalFees: 0,
+      totalSlippage: 0,
+      averageSpread: 0,
     };
   }
 
@@ -729,7 +886,9 @@ function runBacktest(
   let entryRisk = 0;
   let stopPrice = 0;
   let targetPrice = 0;
-  let maxHoldBars = 4;
+  let maxHoldBars = 9;
+  let entryFees = 0;
+  let pendingEntry: PendingEntry | null = null;
   let peak = startingCapital;
   let maxDrawdown = 0;
   let previousEquity = startingCapital;
@@ -749,17 +908,23 @@ function runBacktest(
   let dailyLocked = false;
   let completedSessions = 0;
   let weekStartEquity = startingCapital;
+  let totalFees = 0;
+  let totalSlippage = 0;
+  let spreadTotal = 0;
+  let fillCount = 0;
   const sessions = new Set<string>();
   const weeklyReturns: number[] = [];
   const trades: Trade[] = [];
   const equity: number[] = [];
   const scores: number[] = [];
-  const holdShares = startingCapital / data[0].close;
-  const buyHoldEquity = collectSeries ? data.map((bar) => holdShares * bar.close) : [];
-
-  const commission = (notional: number) => 0.35 + notional * 0.00002;
-  const factorReason = (scored: ReturnType<typeof scoreBar>) =>
-    `${scored.setup} / ${scored.regime.toLowerCase()} / ${scored.confluence} confirmations`;
+  const provisionalHoldShares = startingCapital / data[0].open;
+  const holdEntry = executionFill(data[0], "BUY", data[0].open, provisionalHoldShares);
+  const holdShares = startingCapital / (holdEntry.price + CAT_FEE_PER_SHARE);
+  const holdExit = executionFill(data[data.length - 1], "SELL", data[data.length - 1].close, holdShares);
+  const holdFinalValue = holdShares * holdExit.price - holdExit.fees;
+  const buyHoldEquity = collectSeries
+    ? data.map((bar, index) => index === data.length - 1 ? holdFinalValue : holdShares * bar.close)
+    : [];
 
   data.forEach((bar, index) => {
     sessions.add(bar.date);
@@ -779,35 +944,96 @@ function runBacktest(
     }
     if (cooldownBars > 0) cooldownBars -= 1;
 
+    if (pendingEntry && pendingEntry.signalTimestamp.slice(0, 10) !== bar.date) {
+      pendingEntry = null;
+    }
+    if (pendingEntry && shares === 0 && bar.barInSession <= LAST_ENTRY_BAR) {
+      const riskFraction = pendingEntry.maxHoldBars === 6 ? 0.006 : pendingEntry.maxHoldBars === 9 ? 0.0095 : 0.008;
+      const allocationFraction = pendingEntry.maxHoldBars === 6 ? 0.58 : 0.76;
+      const stopDistance = Math.max(pendingEntry.signalAtr * pendingEntry.stopAtr, pendingEntry.signalPrice * 0.0012);
+      const riskBudget = cash * riskFraction;
+      const allocation = cash * allocationFraction;
+      const provisionalQuantity = Math.floor(Math.min(allocation / bar.open, riskBudget / stopDistance));
+      if (provisionalQuantity > 0) {
+        const side: TradeSide = pendingEntry.side === "LONG" ? "BUY" : "SHORT";
+        const provisionalFill = executionFill(bar, side, bar.open, provisionalQuantity);
+        const quantity = Math.floor(Math.min(allocation / provisionalFill.price, riskBudget / stopDistance));
+        if (quantity > 0) {
+          const fill = executionFill(bar, side, bar.open, quantity);
+          const notional = quantity * fill.price;
+          const cashChange = pendingEntry.side === "LONG" ? -(notional + fill.fees) : notional - fill.fees;
+          if (pendingEntry.side === "SHORT" || cash + cashChange >= 0) {
+            cash += cashChange;
+            shares = pendingEntry.side === "LONG" ? quantity : -quantity;
+            entryPrice = fill.price;
+            entryIndex = index;
+            entryRisk = stopDistance;
+            stopPrice = pendingEntry.side === "LONG" ? fill.price - stopDistance : fill.price + stopDistance;
+            targetPrice = pendingEntry.side === "LONG"
+              ? fill.price + stopDistance * pendingEntry.rewardRisk
+              : fill.price - stopDistance * pendingEntry.rewardRisk;
+            maxHoldBars = pendingEntry.maxHoldBars;
+            entryFees = fill.fees;
+            entriesThisSession += 1;
+            if (pendingEntry.side === "LONG") longEntries += 1;
+            else shortEntries += 1;
+            totalFees += fill.fees;
+            totalSlippage += fill.slippage;
+            spreadTotal += fill.spread;
+            fillCount += 1;
+            if (collectTrades) trades.push({
+              id: `${side.toLowerCase()}-${bar.timestamp}-${index}`,
+              date: bar.date,
+              time: bar.time,
+              timestamp: bar.timestamp,
+              side,
+              price: fill.price,
+              shares: quantity,
+              value: pendingEntry.side === "LONG" ? notional + fill.fees : notional - fill.fees,
+              fees: fill.fees,
+              slippage: fill.slippage,
+              pnl: null,
+              confidence: pendingEntry.confidence,
+              reason: pendingEntry.reason,
+            });
+          }
+        }
+      }
+      pendingEntry = null;
+    }
+
     const scored = scoreBar(bar, weights, collectTrades);
     const score = scored.score;
     latestScore = score;
     if (collectSeries) scores.push(score);
     const confidence = Math.round(clamp(48 + Math.abs(score) * 35 + scored.confluence * 3.2, 50, 98));
     const heldBars = entryIndex >= 0 ? index - entryIndex : 0;
-    const sessionClose = bar.barInSession === 12;
+    const sessionClose = bar.barInSession === BARS_PER_SESSION - 1;
     const threshold = intradayEntryThreshold(weights);
     let exitReason = "";
-    let exitFill = 0;
+    let exitReference = 0;
+    let exitKind: FillKind = "market";
 
     if (shares > 0) {
       const stopHit = bar.low <= stopPrice;
       const targetHit = bar.high >= targetPrice;
       if (stopHit) {
         exitReason = stopPrice >= entryPrice ? "Protected stop" : "ATR risk stop";
-        exitFill = stopPrice * 0.99985;
+        exitReference = Math.min(stopPrice, bar.open);
+        exitKind = "stop";
       } else if (targetHit) {
         exitReason = "Risk / reward target";
-        exitFill = targetPrice * 0.9999;
+        exitReference = targetPrice;
+        exitKind = "limit";
       } else if (sessionClose) {
         exitReason = "Closing bell";
-        exitFill = bar.close * 0.99985;
+        exitReference = bar.close;
       } else if (heldBars >= maxHoldBars) {
         exitReason = "Time stop";
-        exitFill = bar.close * 0.99985;
+        exitReference = bar.close;
       } else if (score < -threshold * 0.72 && scored.confluence >= 3) {
         exitReason = "Confluence reversed";
-        exitFill = bar.close * 0.99985;
+        exitReference = bar.close;
       } else if (heldBars >= 1) {
         if (bar.high >= entryPrice + entryRisk) stopPrice = Math.max(stopPrice, entryPrice * 1.0002);
         stopPrice = Math.max(stopPrice, bar.close - bar.atr * (scored.regime === "TREND" ? 0.78 : 0.62));
@@ -817,19 +1043,21 @@ function runBacktest(
       const targetHit = bar.low <= targetPrice;
       if (stopHit) {
         exitReason = stopPrice <= entryPrice ? "Protected stop" : "ATR risk stop";
-        exitFill = stopPrice * 1.00015;
+        exitReference = Math.max(stopPrice, bar.open);
+        exitKind = "stop";
       } else if (targetHit) {
         exitReason = "Risk / reward target";
-        exitFill = targetPrice * 1.0001;
+        exitReference = targetPrice;
+        exitKind = "limit";
       } else if (sessionClose) {
         exitReason = "Closing bell";
-        exitFill = bar.close * 1.00015;
+        exitReference = bar.close;
       } else if (heldBars >= maxHoldBars) {
         exitReason = "Time stop";
-        exitFill = bar.close * 1.00015;
+        exitReference = bar.close;
       } else if (score > threshold * 0.72 && scored.confluence >= 3) {
         exitReason = "Confluence reversed";
-        exitFill = bar.close * 1.00015;
+        exitReference = bar.close;
       } else if (heldBars >= 1) {
         if (bar.low <= entryPrice - entryRisk) stopPrice = Math.min(stopPrice, entryPrice * 0.9998);
         stopPrice = Math.min(stopPrice, bar.close + bar.atr * (scored.regime === "TREND" ? 0.78 : 0.62));
@@ -838,11 +1066,15 @@ function runBacktest(
 
     if (shares > 0 && exitReason) {
       const quantity = shares;
-      const notional = quantity * exitFill;
-      const fee = commission(notional);
-      const proceeds = notional - fee;
-      const pnl = (exitFill - entryPrice) * quantity - fee - commission(quantity * entryPrice);
+      const fill = executionFill(bar, "SELL", exitReference, quantity, exitKind);
+      const notional = quantity * fill.price;
+      const proceeds = notional - fill.fees;
+      const pnl = (fill.price - entryPrice) * quantity - fill.fees - entryFees;
       cash += proceeds;
+      totalFees += fill.fees;
+      totalSlippage += fill.slippage;
+      spreadTotal += fill.spread;
+      fillCount += 1;
       exits += 1;
       totalHoldBars += heldBars;
       if (pnl > 0) wins += 1;
@@ -852,9 +1084,11 @@ function runBacktest(
         time: bar.time,
         timestamp: bar.timestamp,
         side: "SELL",
-        price: exitFill,
+        price: fill.price,
         shares: quantity,
         value: proceeds,
+        fees: fill.fees,
+        slippage: fill.slippage,
         pnl,
         confidence,
         reason: exitReason,
@@ -865,14 +1099,19 @@ function runBacktest(
       entryRisk = 0;
       stopPrice = 0;
       targetPrice = 0;
+      entryFees = 0;
       cooldownBars = 1;
     } else if (shares < 0 && exitReason) {
       const quantity = Math.abs(shares);
-      const notional = quantity * exitFill;
-      const fee = commission(notional);
-      const cost = notional + fee;
-      const pnl = (entryPrice - exitFill) * quantity - fee - commission(quantity * entryPrice);
+      const fill = executionFill(bar, "COVER", exitReference, quantity, exitKind);
+      const notional = quantity * fill.price;
+      const cost = notional + fill.fees;
+      const pnl = (entryPrice - fill.price) * quantity - fill.fees - entryFees;
       cash -= cost;
+      totalFees += fill.fees;
+      totalSlippage += fill.slippage;
+      spreadTotal += fill.spread;
+      fillCount += 1;
       exits += 1;
       totalHoldBars += heldBars;
       if (pnl > 0) wins += 1;
@@ -882,9 +1121,11 @@ function runBacktest(
         time: bar.time,
         timestamp: bar.timestamp,
         side: "COVER",
-        price: exitFill,
+        price: fill.price,
         shares: quantity,
         value: cost,
+        fees: fill.fees,
+        slippage: fill.slippage,
         pnl,
         confidence,
         reason: exitReason,
@@ -895,94 +1136,16 @@ function runBacktest(
       entryRisk = 0;
       stopPrice = 0;
       targetPrice = 0;
+      entryFees = 0;
       cooldownBars = 1;
     } else if (
-      index > 30 &&
       shares === 0 &&
+      !pendingEntry &&
       cooldownBars === 0 &&
       !dailyLocked &&
-      entriesThisSession < 5 &&
-      bar.barInSession >= 1 &&
-      bar.barInSession <= 10 &&
-      bar.volumeRatio > 0.58 &&
-      scored.confluence >= (bar.volumeRatio >= 1.15 ? 2 : 3) &&
-      (Math.abs(scored.factors.orb) >= 0.24 ||
-        Math.abs(scored.factors.pullback) >= 0.24 ||
-        Math.abs(scored.factors.squeeze) >= 0.18 ||
-        Math.abs(scored.factors.levels) >= 0.36 ||
-        scored.confluence >= 5)
+      entriesThisSession < MAX_ENTRIES_PER_SESSION
     ) {
-      const portfolioValue = cash;
-      const stopDistance = Math.max(bar.atr * scored.stopAtr, bar.close * 0.0026);
-      const riskFraction = scored.regime === "RANGE" ? 0.006 : scored.regime === "SQUEEZE" ? 0.0095 : 0.008;
-      const riskBudget = portfolioValue * riskFraction;
-      const allocation = portfolioValue * (scored.regime === "RANGE" ? 0.58 : 0.76);
-      const dynamicThreshold = threshold * (bar.barInSession >= 9 ? 1.08 : 1);
-      if (score > dynamicThreshold) {
-        const fill = bar.close * 1.00015;
-        const quantity = Math.floor(Math.min(allocation / fill, riskBudget / stopDistance));
-        if (quantity > 0) {
-          const notional = quantity * fill;
-          const fee = commission(notional);
-          const cost = notional + fee;
-          if (cost <= cash) {
-            cash -= cost;
-            shares = quantity;
-            entryPrice = fill;
-            entryIndex = index;
-            entryRisk = stopDistance;
-            stopPrice = fill - stopDistance;
-            targetPrice = fill + stopDistance * scored.rewardRisk;
-            maxHoldBars = scored.regime === "TREND" ? 5 : scored.regime === "SQUEEZE" ? 4 : 3;
-            entriesThisSession += 1;
-            longEntries += 1;
-            if (collectTrades) trades.push({
-              id: `buy-${bar.timestamp}-${index}`,
-              date: bar.date,
-              time: bar.time,
-              timestamp: bar.timestamp,
-              side: "BUY",
-              price: fill,
-              shares: quantity,
-              value: cost,
-              pnl: null,
-              confidence,
-              reason: collectTrades ? factorReason(scored) : "Confluence setup",
-            });
-          }
-        }
-      } else if (score < -dynamicThreshold) {
-        const fill = bar.close * 0.99985;
-        const quantity = Math.floor(Math.min(allocation / fill, riskBudget / stopDistance));
-        if (quantity > 0) {
-          const notional = quantity * fill;
-          const fee = commission(notional);
-          const proceeds = notional - fee;
-          cash += proceeds;
-          shares = -quantity;
-          entryPrice = fill;
-          entryIndex = index;
-          entryRisk = stopDistance;
-          stopPrice = fill + stopDistance;
-          targetPrice = fill - stopDistance * scored.rewardRisk;
-          maxHoldBars = scored.regime === "TREND" ? 5 : scored.regime === "SQUEEZE" ? 4 : 3;
-          entriesThisSession += 1;
-          shortEntries += 1;
-          if (collectTrades) trades.push({
-            id: `short-${bar.timestamp}-${index}`,
-            date: bar.date,
-            time: bar.time,
-            timestamp: bar.timestamp,
-            side: "SHORT",
-            price: fill,
-            shares: quantity,
-            value: proceeds,
-            pnl: null,
-            confidence,
-            reason: collectTrades ? factorReason(scored) : "Confluence setup",
-          });
-        }
-      }
+      pendingEntry = pendingEntryForBar(bar, weights, scored);
     }
 
     const portfolioValue = cash + shares * bar.close;
@@ -1002,7 +1165,7 @@ function runBacktest(
 
   const finalValue = cash + shares * data[data.length - 1].close;
   const strategyReturn = finalValue / startingCapital - 1;
-  const buyHoldReturn = data[data.length - 1].close / data[0].close - 1;
+  const buyHoldReturn = holdFinalValue / startingCapital - 1;
   const returnDeviation = Math.sqrt(returnSquaredDelta / Math.max(1, returnCount));
   if (weeklyReturns.length < Math.ceil(sessions.size / 5)) {
     weeklyReturns.push(finalValue / weekStartEquity - 1);
@@ -1018,7 +1181,7 @@ function runBacktest(
     buyHoldReturn,
     alpha: strategyReturn - buyHoldReturn,
     maxDrawdown,
-    sharpe: returnDeviation === 0 ? 0 : (averageReturn / returnDeviation) * Math.sqrt(252 * 13),
+    sharpe: returnDeviation === 0 ? 0 : (averageReturn / returnDeviation) * Math.sqrt(252 * BARS_PER_SESSION),
     winRate: exits === 0 ? 0 : wins / exits,
     trades,
     equity,
@@ -1033,7 +1196,208 @@ function runBacktest(
     averageHoldBars: exits === 0 ? 0 : totalHoldBars / exits,
     averageWeekReturn,
     positiveWeekRate,
+    totalFees,
+    totalSlippage,
+    averageSpread: fillCount === 0 ? 0 : spreadTotal / fillCount,
   };
+}
+
+function appendPaperMark(account: PaperAccount, bar: MarketBar): PaperAccount {
+  return {
+    ...account,
+    lastBarTimestamp: bar.timestamp,
+    orders: account.orders.slice(0, 80),
+    equityHistory: [
+      ...account.equityHistory,
+      { time: bar.timestamp, value: account.cash + account.shares * bar.close },
+    ].slice(-160),
+  };
+}
+
+function advancePaperAccount(
+  account: PaperAccount,
+  bar: MarketBar,
+  weights: ModelWeights,
+): PaperAccount {
+  let next: PaperAccount = { ...account };
+  const newSession = next.currentSession !== bar.date;
+  if (newSession) {
+    next = {
+      ...next,
+      currentSession: bar.date,
+      entriesThisSession: 0,
+      cooldownBars: 0,
+      dailyStartEquity: next.cash + next.shares * bar.open,
+      dailyLocked: false,
+      pendingEntry: null,
+    };
+  } else if (next.cooldownBars > 0) {
+    next.cooldownBars -= 1;
+  }
+
+  if (next.pendingEntry && next.pendingEntry.signalTimestamp.slice(0, 10) !== bar.date) {
+    next.pendingEntry = null;
+  }
+
+  if (next.pendingEntry && next.shares === 0 && bar.barInSession <= LAST_ENTRY_BAR) {
+    const signal = next.pendingEntry;
+    const riskFraction = signal.maxHoldBars === 6 ? 0.006 : signal.maxHoldBars === 9 ? 0.0095 : 0.008;
+    const allocationFraction = signal.maxHoldBars === 6 ? 0.58 : 0.76;
+    const stopDistance = Math.max(signal.signalAtr * signal.stopAtr, signal.signalPrice * 0.0012);
+    const riskBudget = next.cash * riskFraction;
+    const allocation = next.cash * allocationFraction;
+    const provisionalQuantity = Math.floor(Math.min(allocation / bar.open, riskBudget / stopDistance));
+    if (provisionalQuantity > 0) {
+      const side: TradeSide = signal.side === "LONG" ? "BUY" : "SHORT";
+      const provisionalFill = executionFill(bar, side, bar.open, provisionalQuantity);
+      const quantity = Math.floor(Math.min(allocation / provisionalFill.price, riskBudget / stopDistance));
+      if (quantity > 0) {
+        const fill = executionFill(bar, side, bar.open, quantity);
+        const notional = quantity * fill.price;
+        const cashChange = signal.side === "LONG" ? -(notional + fill.fees) : notional - fill.fees;
+        if (signal.side === "SHORT" || next.cash + cashChange >= 0) {
+          next = {
+            ...next,
+            cash: next.cash + cashChange,
+            shares: signal.side === "LONG" ? quantity : -quantity,
+            avgPrice: fill.price,
+            positionOpenedAt: Date.now(),
+            stopPrice: signal.side === "LONG" ? fill.price - stopDistance : fill.price + stopDistance,
+            targetPrice: signal.side === "LONG"
+              ? fill.price + stopDistance * signal.rewardRisk
+              : fill.price - stopDistance * signal.rewardRisk,
+            entrySetup: signal.setup,
+            entryFees: fill.fees,
+            entrySlippage: fill.slippage,
+            entryRisk: stopDistance,
+            barsHeld: 0,
+            maxHoldBars: signal.maxHoldBars,
+            entriesThisSession: next.entriesThisSession + 1,
+            orders: [{
+              id: `paper-${side.toLowerCase()}-${bar.timestamp}-${next.orders.length}`,
+              time: `${bar.date} ${bar.time} ET`,
+              side,
+              shares: quantity,
+              price: fill.price,
+              fees: fill.fees,
+              slippage: fill.slippage,
+              note: signal.reason,
+            }, ...next.orders],
+          };
+        }
+      }
+    }
+    next.pendingEntry = null;
+  }
+
+  const scored = scoreBar(bar, weights, true);
+  const threshold = intradayEntryThreshold(weights);
+  const sessionClose = bar.barInSession === BARS_PER_SESSION - 1;
+  const heldBars = next.shares === 0 ? 0 : next.barsHeld;
+  let exitReason = "";
+  let exitReference = 0;
+  let exitKind: FillKind = "market";
+
+  if (next.shares > 0) {
+    if (bar.low <= next.stopPrice) {
+      exitReason = next.stopPrice >= next.avgPrice ? "Protected stop" : "ATR risk stop";
+      exitReference = Math.min(next.stopPrice, bar.open);
+      exitKind = "stop";
+    } else if (bar.high >= next.targetPrice) {
+      exitReason = "Risk / reward target";
+      exitReference = next.targetPrice;
+      exitKind = "limit";
+    } else if (sessionClose) {
+      exitReason = "Closing bell";
+      exitReference = bar.close;
+    } else if (heldBars >= next.maxHoldBars) {
+      exitReason = "Time stop";
+      exitReference = bar.close;
+    } else if (scored.score < -threshold * 0.72 && scored.confluence >= 3) {
+      exitReason = "Confluence reversed";
+      exitReference = bar.close;
+    } else if (heldBars >= 1) {
+      const protectedStop = bar.high >= next.avgPrice + next.entryRisk
+        ? Math.max(next.stopPrice, next.avgPrice * 1.0002)
+        : next.stopPrice;
+      next.stopPrice = Math.max(protectedStop, bar.close - bar.atr * (scored.regime === "TREND" ? 0.78 : 0.62));
+    }
+  } else if (next.shares < 0) {
+    if (bar.high >= next.stopPrice) {
+      exitReason = next.stopPrice <= next.avgPrice ? "Protected stop" : "ATR risk stop";
+      exitReference = Math.max(next.stopPrice, bar.open);
+      exitKind = "stop";
+    } else if (bar.low <= next.targetPrice) {
+      exitReason = "Risk / reward target";
+      exitReference = next.targetPrice;
+      exitKind = "limit";
+    } else if (sessionClose) {
+      exitReason = "Closing bell";
+      exitReference = bar.close;
+    } else if (heldBars >= next.maxHoldBars) {
+      exitReason = "Time stop";
+      exitReference = bar.close;
+    } else if (scored.score > threshold * 0.72 && scored.confluence >= 3) {
+      exitReason = "Confluence reversed";
+      exitReference = bar.close;
+    } else if (heldBars >= 1) {
+      const protectedStop = bar.low <= next.avgPrice - next.entryRisk
+        ? Math.min(next.stopPrice, next.avgPrice * 0.9998)
+        : next.stopPrice;
+      next.stopPrice = Math.min(protectedStop, bar.close + bar.atr * (scored.regime === "TREND" ? 0.78 : 0.62));
+    }
+  }
+
+  if (next.shares !== 0 && exitReason) {
+    const quantity = Math.abs(next.shares);
+    const side: TradeSide = next.shares > 0 ? "SELL" : "COVER";
+    const fill = executionFill(bar, side, exitReference, quantity, exitKind);
+    const notional = quantity * fill.price;
+    const pnl = next.shares > 0
+      ? (fill.price - next.avgPrice) * quantity - fill.fees - next.entryFees
+      : (next.avgPrice - fill.price) * quantity - fill.fees - next.entryFees;
+    next = {
+      ...next,
+      cash: next.shares > 0 ? next.cash + notional - fill.fees : next.cash - notional - fill.fees,
+      shares: 0,
+      avgPrice: 0,
+      positionOpenedAt: 0,
+      stopPrice: 0,
+      targetPrice: 0,
+      entrySetup: "",
+      entryFees: 0,
+      entrySlippage: 0,
+      entryRisk: 0,
+      barsHeld: 0,
+      maxHoldBars: 9,
+      cooldownBars: 1,
+      realized: next.realized + pnl,
+      orders: [{
+        id: `paper-${side.toLowerCase()}-${bar.timestamp}-${next.orders.length}`,
+        time: `${bar.date} ${bar.time} ET`,
+        side,
+        shares: quantity,
+        price: fill.price,
+        fees: fill.fees,
+        slippage: fill.slippage,
+        note: exitReason,
+      }, ...next.orders],
+    };
+  } else if (
+    next.shares === 0 &&
+    !next.pendingEntry &&
+    next.cooldownBars === 0 &&
+    !next.dailyLocked &&
+    next.entriesThisSession < MAX_ENTRIES_PER_SESSION
+  ) {
+    next.pendingEntry = pendingEntryForBar(bar, weights, scored);
+  } else if (next.shares !== 0) {
+    next.barsHeld += 1;
+  }
+
+  const equity = next.cash + next.shares * bar.close;
+  if (equity <= next.dailyStartEquity * 0.982) next.dailyLocked = true;
+  return appendPaperMark(next, bar);
 }
 
 function oracleAction(data: MarketBar[], index: number): Position {
@@ -1074,10 +1438,15 @@ function teacherAgreement(data: MarketBar[], weights: ModelWeights) {
 }
 
 function splitForTraining(data: MarketBar[]) {
-  const splitIndex = Math.max(70, Math.floor(data.length * 0.72));
+  const sessions = [...new Set(data.map((bar) => bar.date))];
+  const splitSessionIndex = Math.max(
+    20,
+    Math.min(sessions.length - 10, Math.floor(sessions.length * 0.72)),
+  );
+  const validationStart = sessions[splitSessionIndex] ?? sessions[sessions.length - 1] ?? "";
   return {
-    trainingData: data.slice(0, Math.min(splitIndex, data.length - 30)),
-    validationData: data.slice(Math.max(0, Math.min(splitIndex, data.length - 30) - 22)),
+    trainingData: data.filter((bar) => bar.date < validationStart),
+    validationData: data.filter((bar) => bar.date >= validationStart),
   };
 }
 
@@ -1086,9 +1455,9 @@ function evaluateModel(data: MarketBar[], weights: ModelWeights) {
   const trainingResult = runBacktest(trainingData, weights, STARTING_CAPITAL, false);
   const validationResult = runBacktest(validationData, weights, STARTING_CAPITAL, false);
   const agreement = teacherAgreement(trainingData, weights);
-  const turnoverPenalty = Math.max(0, trainingResult.tradesPerDay - 3.2);
-  const undertradingPenalty = Math.max(0, 0.8 - validationResult.tradesPerDay);
-  const cadenceReward = Math.min(2.2, validationResult.tradesPerDay) * 0.004;
+  const turnoverPenalty = Math.max(0, trainingResult.tradesPerDay - 6.5);
+  const undertradingPenalty = Math.max(0, 2 - validationResult.tradesPerDay);
+  const cadenceReward = Math.min(5, validationResult.tradesPerDay) * 0.003;
   const objective =
     validationResult.strategyReturn * 0.58 +
     validationResult.alpha * 0.42 +
@@ -1239,7 +1608,7 @@ function MarketChart({
     trades: true,
   });
 
-  const requestedBars = viewport === "ALL" ? data.length : viewport === "1M" ? 13 * 22 : viewport === "2W" ? 13 * 10 : 13 * 5;
+  const requestedBars = viewport === "ALL" ? data.length : viewport === "1M" ? BARS_PER_SESSION * 22 : viewport === "2W" ? BARS_PER_SESSION * 10 : BARS_PER_SESSION * 5;
   const offset = Math.max(0, data.length - requestedBars);
   const visible = data.slice(offset);
   const visibleScores = result.scores.slice(offset);
@@ -1859,6 +2228,9 @@ function migrateModel(value: unknown, version: number): ModelWeights {
 
 function normalizePaper(value: unknown): PaperAccount {
   const paper = (value ?? {}) as Partial<PaperAccount>;
+  const pending = paper.pendingEntry && typeof paper.pendingEntry === "object"
+    ? paper.pendingEntry as PendingEntry
+    : null;
   return {
     cash: finiteNumber(paper.cash, PAPER_STARTING_CASH),
     shares: Math.trunc(finiteNumber(paper.shares, 0)),
@@ -1867,8 +2239,39 @@ function normalizePaper(value: unknown): PaperAccount {
     stopPrice: Math.max(0, finiteNumber(paper.stopPrice, 0)),
     targetPrice: Math.max(0, finiteNumber(paper.targetPrice, 0)),
     entrySetup: typeof paper.entrySetup === "string" ? paper.entrySetup : "",
+    entryFees: Math.max(0, finiteNumber(paper.entryFees, 0)),
+    entrySlippage: Math.max(0, finiteNumber(paper.entrySlippage, 0)),
+    entryRisk: Math.max(0, finiteNumber(paper.entryRisk, 0)),
+    barsHeld: Math.max(0, Math.trunc(finiteNumber(paper.barsHeld, 0))),
+    maxHoldBars: Math.max(1, Math.trunc(finiteNumber(paper.maxHoldBars, 9))),
+    pendingEntry: pending && (pending.side === "LONG" || pending.side === "SHORT")
+      ? {
+          side: pending.side,
+          setup: typeof pending.setup === "string" ? pending.setup : "Multi-signal confluence",
+          confidence: clamp(finiteNumber(pending.confidence, 50), 0, 100),
+          stopAtr: Math.max(0.1, finiteNumber(pending.stopAtr, 0.9)),
+          rewardRisk: Math.max(0.5, finiteNumber(pending.rewardRisk, 1.5)),
+          maxHoldBars: Math.max(1, Math.trunc(finiteNumber(pending.maxHoldBars, 9))),
+          reason: typeof pending.reason === "string" ? pending.reason : "Saved five-minute signal",
+          signalPrice: Math.max(0.01, finiteNumber(pending.signalPrice, 1)),
+          signalAtr: Math.max(0.01, finiteNumber(pending.signalAtr, 0.5)),
+          signalTimestamp: typeof pending.signalTimestamp === "string" ? pending.signalTimestamp : "",
+        }
+      : null,
+    currentSession: typeof paper.currentSession === "string" ? paper.currentSession : "",
+    entriesThisSession: Math.max(0, Math.trunc(finiteNumber(paper.entriesThisSession, 0))),
+    cooldownBars: Math.max(0, Math.trunc(finiteNumber(paper.cooldownBars, 0))),
+    dailyStartEquity: Math.max(0, finiteNumber(paper.dailyStartEquity, PAPER_STARTING_CASH)),
+    dailyLocked: Boolean(paper.dailyLocked),
+    lastBarTimestamp: typeof paper.lastBarTimestamp === "string" ? paper.lastBarTimestamp : "",
     realized: finiteNumber(paper.realized, 0),
-    orders: Array.isArray(paper.orders) ? paper.orders.slice(0, 80) : [],
+    orders: Array.isArray(paper.orders)
+      ? paper.orders.slice(0, 80).map((order) => ({
+          ...order,
+          fees: Math.max(0, finiteNumber(order.fees, 0)),
+          slippage: Math.max(0, finiteNumber(order.slippage, 0)),
+        }))
+      : [],
     equityHistory: Array.isArray(paper.equityHistory) ? paper.equityHistory.slice(-120) : [],
   };
 }
@@ -1880,14 +2283,19 @@ function normalizePersistedState(value: unknown): PersistedLabState | null {
   const savedVersion = Math.trunc(finiteNumber(state.version, 1));
   return {
     version: STATE_VERSION,
+    theme: state.theme === "light" || state.theme === "dark" ? state.theme : "dark",
     model: migrateModel(state.model, savedVersion),
     trainingEpoch: Math.max(0, Math.trunc(finiteNumber(state.trainingEpoch, 1840))),
     trainingRuns: Array.isArray(state.trainingRuns) ? state.trainingRuns.slice(0, 40) : [],
     paper: normalizePaper(state.paper),
-    range:
-      range && typeof range.start === "string" && typeof range.end === "string"
-        ? range
-        : { start: DEFAULT_START, end: DEFAULT_END },
+    range: range &&
+      typeof range.start === "string" &&
+      typeof range.end === "string" &&
+      range.start >= BACKTEST_MIN &&
+      range.end <= DATA_END &&
+      range.start < range.end
+      ? range
+      : { start: DEFAULT_START, end: DEFAULT_END },
   };
 }
 
@@ -1896,7 +2304,7 @@ export default function Home() {
   const [draftEnd, setDraftEnd] = useState(DEFAULT_END);
   const [range, setRange] = useState({ start: DEFAULT_START, end: DEFAULT_END });
   const [viewport, setViewport] = useState<"ALL" | "1M" | "2W" | "5D">("2W");
-  const [activeView, setActiveView] = useState<"chart" | "train" | "paper">("chart");
+  const [activeView, setActiveView] = useState<"chart" | "train" | "paper" | "guide">("chart");
   const [backtestTab, setBacktestTab] = useState<"chart" | "performance" | "trades">("chart");
   const [trainingTab, setTrainingTab] = useState<"run" | "checkpoints" | "policy">("run");
   const [portfolioTab, setPortfolioTab] = useState<"account" | "orders" | "automation">("account");
@@ -1911,13 +2319,21 @@ export default function Home() {
   const [trainingRuns, setTrainingRuns] = useState<TrainingRun[]>([]);
   const [syncStatus, setSyncStatus] = useState<"loading" | "saving" | "saved" | "offline">("loading");
   const [hydrated, setHydrated] = useState(false);
+  const [accountStatus, setAccountStatus] = useState<"loading" | "anonymous" | "authenticated">("loading");
+  const [accountUser, setAccountUser] = useState<AccountUser | null>(null);
+  const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>(null);
+  const [authMode, setAuthMode] = useState<"login" | "register">("login");
+  const [authUsername, setAuthUsername] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authError, setAuthError] = useState("");
+  const [authBusy, setAuthBusy] = useState(false);
   const [clock, setClock] = useState<Date | null>(null);
   const [paperActive, setPaperActive] = useState(false);
   const [replayMode, setReplayMode] = useState(false);
-  const [paperPrice, setPaperPrice] = useState(MARKET_DATA[MARKET_DATA.length - 1].close);
+  const [paperPrice, setPaperPrice] = useState(PAPER_STREAM[0]?.open ?? MARKET_DATA[MARKET_DATA.length - 1].close);
+  const [paperBarIndex, setPaperBarIndex] = useState(0);
   const [paper, setPaper] = useState<PaperAccount>({ ...INITIAL_PAPER });
   const [toast, setToast] = useState("");
-  const tickRef = useRef(0);
   const saveTimerRef = useRef<number | null>(null);
 
   const filteredData = useMemo(
@@ -1927,8 +2343,8 @@ export default function Home() {
   const result = useMemo(() => runBacktest(filteredData, model), [filteredData, model]);
   const sessionCount = useMemo(() => new Set(filteredData.map((bar) => bar.date)).size, [filteredData]);
   const trainingEvaluation = useMemo(
-    () => (filteredData.length >= 260 ? evaluateModel(filteredData, model) : null),
-    [filteredData, model],
+    () => (TRAINING_DATA.length >= BARS_PER_SESSION * 30 ? evaluateModel(TRAINING_DATA, model) : null),
+    [model],
   );
   const latest = filteredData[filteredData.length - 1] ?? MARKET_DATA[MARKET_DATA.length - 1];
   const previous = filteredData[filteredData.length - 2] ?? latest;
@@ -1947,7 +2363,9 @@ export default function Home() {
         : 0;
   const validationResult = trainingEvaluation?.validationResult ?? result;
   const currentTeacherAgreement = trainingEvaluation?.agreement ?? 0;
-  const trainingSplitCount = Math.max(0, Math.min(Math.max(70, Math.floor(filteredData.length * 0.72)), filteredData.length - 30));
+  const trainingSplit = useMemo(() => splitForTraining(TRAINING_DATA), []);
+  const trainingSplitCount = trainingSplit.trainingData.length;
+  const trainingSessionCount = useMemo(() => new Set(TRAINING_DATA.map((bar) => bar.date)).size, []);
 
   useEffect(() => {
     const immediate = window.setTimeout(() => setClock(new Date()), 0);
@@ -1960,13 +2378,7 @@ export default function Home() {
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
-      const savedTheme = window.localStorage.getItem("signal-forge-theme");
-      const nextTheme =
-        savedTheme === "light" || savedTheme === "dark"
-          ? savedTheme
-          : window.matchMedia("(prefers-color-scheme: light)").matches
-            ? "light"
-            : "dark";
+      const nextTheme = window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
       setTheme(nextTheme);
       setThemeReady(true);
     }, 0);
@@ -1976,47 +2388,88 @@ export default function Home() {
   useEffect(() => {
     if (!themeReady) return;
     document.documentElement.dataset.theme = theme;
-    window.localStorage.setItem("signal-forge-theme", theme);
   }, [theme, themeReady]);
 
   useEffect(() => {
+    let cancelled = false;
+    const loadSession = async () => {
+      try {
+        const response = await fetch("/api/auth/session", { cache: "no-store" });
+        const body = await response.json() as { user?: AccountUser | null };
+        if (!response.ok) throw new Error("Account service unavailable");
+        if (cancelled) return;
+        if (body.user) {
+          setAccountUser(body.user);
+          setAccountStatus("authenticated");
+        } else {
+          setAccountStatus("anonymous");
+        }
+      } catch {
+        if (!cancelled) {
+          setAccountStatus("anonymous");
+          setAuthError("Account storage is temporarily unavailable. You can retry in a moment.");
+        }
+      }
+    };
+    void loadSession();
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    if (accountStatus !== "authenticated" || !accountUser) {
+      return;
+    }
     let cancelled = false;
     const loadPersistentState = async () => {
       setSyncStatus("loading");
       try {
         const response = await fetch("/api/state", { cache: "no-store" });
+        if (response.status === 401) {
+          setAccountUser(null);
+          setAccountStatus("anonymous");
+          return;
+        }
         if (!response.ok) throw new Error("State load failed");
         const body = (await response.json()) as { state?: unknown };
         const saved = normalizePersistedState(body.state);
         if (!cancelled && saved) {
           setModel(saved.model);
+          setTheme(saved.theme);
           setTrainingEpoch(saved.trainingEpoch);
           setTrainingRuns(saved.trainingRuns);
           setPaper(saved.paper);
           setRange(saved.range);
           setDraftStart(saved.range.start);
           setDraftEnd(saved.range.end);
+          const savedBarIndex = PAPER_STREAM.findIndex((bar) => bar.timestamp === saved.paper.lastBarTimestamp);
+          const nextIndex = savedBarIndex < 0 ? 0 : Math.min(PAPER_STREAM.length, savedBarIndex + 1);
+          setPaperBarIndex(nextIndex);
+          setPaperPrice(savedBarIndex < 0
+            ? (PAPER_STREAM[0]?.open ?? MARKET_DATA[MARKET_DATA.length - 1].close)
+            : PAPER_STREAM[savedBarIndex].close);
         }
-        if (!cancelled) setSyncStatus("saved");
+        if (!cancelled) {
+          setSyncStatus("saved");
+          setHydrated(true);
+        }
       } catch {
         if (!cancelled) setSyncStatus("offline");
-      } finally {
-        if (!cancelled) setHydrated(true);
       }
     };
     void loadPersistentState();
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [accountStatus, accountUser]);
 
   useEffect(() => {
-    if (!hydrated) return;
+    if (!hydrated || accountStatus !== "authenticated" || !accountUser) return;
     if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
     saveTimerRef.current = window.setTimeout(async () => {
       setSyncStatus("saving");
       const state: PersistedLabState = {
         version: STATE_VERSION,
+        theme,
         model,
         trainingEpoch,
         trainingRuns: trainingRuns.slice(0, 40),
@@ -2029,6 +2482,12 @@ export default function Home() {
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ state }),
         });
+        if (response.status === 401) {
+          setAccountUser(null);
+          setAccountStatus("anonymous");
+          setWorkspaceMode(null);
+          throw new Error("Session expired");
+        }
         if (!response.ok) throw new Error("State save failed");
         setSyncStatus("saved");
       } catch {
@@ -2038,7 +2497,7 @@ export default function Home() {
     return () => {
       if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
     };
-  }, [hydrated, model, paper, range, trainingEpoch, trainingRuns]);
+  }, [accountStatus, accountUser, hydrated, model, paper, range, theme, trainingEpoch, trainingRuns]);
 
   useEffect(() => {
     if (!toast) return;
@@ -2046,6 +2505,7 @@ export default function Home() {
     return () => window.clearTimeout(timer);
   }, [toast]);
 
+  /* Retained below only as migration history; the active simulator uses real five-minute bars.
   useEffect(() => {
     if (!paperActive || (!marketClock.isOpen && !replayMode)) return;
     const timer = window.setInterval(() => {
@@ -2185,7 +2645,7 @@ export default function Home() {
   useEffect(() => {
     if (marketClock.isOpen || replayMode || paper.shares === 0) return;
     const timer = window.setTimeout(() => {
-      setPaper((account) => {
+      setPaper((account): PaperAccount => {
         if (account.shares === 0) return account;
         const quantity = Math.abs(account.shares);
         const time = "4:00 PM";
@@ -2203,7 +2663,7 @@ export default function Home() {
             targetPrice: 0,
             entrySetup: "",
             realized: account.realized + realized,
-            orders: [{ id: `paper-close-${stamp}`, time, side: "SELL", shares: quantity, price: paperPrice, note: "Closing bell / no overnight risk" }, ...account.orders].slice(0, 80),
+            orders: [{ id: `paper-close-${stamp}`, time, side: "SELL" as const, shares: quantity, price: paperPrice, note: "Closing bell / no overnight risk" }, ...account.orders].slice(0, 80),
           };
         }
         const cost = quantity * paperPrice + 1;
@@ -2218,16 +2678,93 @@ export default function Home() {
           targetPrice: 0,
           entrySetup: "",
           realized: account.realized + realized,
-          orders: [{ id: `paper-cover-close-${stamp}`, time, side: "COVER", shares: quantity, price: paperPrice, note: "Closing bell / no overnight risk" }, ...account.orders].slice(0, 80),
+          orders: [{ id: `paper-cover-close-${stamp}`, time, side: "COVER" as const, shares: quantity, price: paperPrice, note: "Closing bell / no overnight risk" }, ...account.orders].slice(0, 80),
         };
       });
     }, 0);
     return () => window.clearTimeout(timer);
   }, [marketClock.isOpen, paper.shares, paperPrice, replayMode]);
+  */
+
+  useEffect(() => {
+    if (!paperActive || (!marketClock.isOpen && !replayMode)) return;
+    if (paperBarIndex >= PAPER_STREAM.length) return;
+    const delay = replayMode ? 850 : BAR_MINUTES * 60 * 1000;
+    const timer = window.setTimeout(() => {
+      const bar = PAPER_STREAM[paperBarIndex];
+      setPaper((account) => advancePaperAccount(account, bar, model));
+      setPaperPrice(bar.close);
+      setPaperBarIndex((index) => index + 1);
+      if (paperBarIndex === PAPER_STREAM.length - 1) {
+        setPaperActive(false);
+        setReplayMode(false);
+        setToast("Sandbox session complete / every five-minute candle processed");
+      }
+    }, delay);
+    return () => window.clearTimeout(timer);
+  }, [marketClock.isOpen, model, paperActive, paperBarIndex, replayMode]);
+
+  const submitAuth = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (authBusy) return;
+    setAuthBusy(true);
+    setAuthError("");
+    try {
+      const response = await fetch(`/api/auth/${authMode}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ username: authUsername, password: authPassword }),
+      });
+      const body = await response.json() as { user?: AccountUser; error?: string };
+      if (!response.ok || !body.user) throw new Error(body.error || "Sign in failed.");
+      setModel(INITIAL_MODEL);
+      setTrainingEpoch(1840);
+      setTrainingRuns([]);
+      setPaper({ ...INITIAL_PAPER });
+      setRange({ start: DEFAULT_START, end: DEFAULT_END });
+      setDraftStart(DEFAULT_START);
+      setDraftEnd(DEFAULT_END);
+      setPaperBarIndex(0);
+      setPaperPrice(PAPER_STREAM[0]?.open ?? MARKET_DATA[MARKET_DATA.length - 1].close);
+      setHydrated(false);
+      setAccountUser(body.user);
+      setAccountStatus("authenticated");
+      setWorkspaceMode(null);
+      setAuthPassword("");
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : "Sign in failed.");
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
+  const signOut = async () => {
+    setPaperActive(false);
+    setReplayMode(false);
+    try {
+      await fetch("/api/auth/logout", { method: "POST" });
+    } finally {
+      setAccountUser(null);
+      setAccountStatus("anonymous");
+      setWorkspaceMode(null);
+      setHydrated(false);
+      setSyncStatus("loading");
+      setModel(INITIAL_MODEL);
+      setTrainingEpoch(1840);
+      setTrainingRuns([]);
+      setPaper({ ...INITIAL_PAPER });
+      setPaperBarIndex(0);
+      setPaperPrice(PAPER_STREAM[0]?.open ?? MARKET_DATA[MARKET_DATA.length - 1].close);
+    }
+  };
 
   const applyRange = () => {
     if (!draftStart || !draftEnd || draftStart >= draftEnd) {
       setRangeError("Choose an end date after the start date.");
+      return;
+    }
+    if (draftStart < BACKTEST_MIN) {
+      setRangeError(`Backtests begin ${BACKTEST_MIN}. The entire 2023 tape is reserved for training.`);
       return;
     }
     const bars = MARKET_DATA.filter(
@@ -2251,8 +2788,8 @@ export default function Home() {
 
   const trainModel = useCallback(async () => {
     if (training) return;
-    if (filteredData.length < 260) {
-      setToast("Training needs at least 20 market days for a holdout window");
+    if (TRAINING_DATA.length < BARS_PER_SESSION * 30) {
+      setToast("The isolated 2023 training tape is unavailable");
       return;
     }
 
@@ -2261,14 +2798,14 @@ export default function Home() {
     setTrainingProgress(0);
     const trainingStartedAt = Date.now();
     const startingEpoch = trainingEpoch;
-    const { trainingData } = splitForTraining(filteredData);
+    const { trainingData } = splitForTraining(TRAINING_DATA);
     let bestModel = { ...model };
-    const baseline = evaluateModel(filteredData, bestModel);
+    const baseline = evaluateModel(TRAINING_DATA, bestModel);
     let bestEvaluation = baseline;
     let bestObjective = baseline.objective;
 
     const teacherSeed = teacherSeedModel(trainingData, model);
-    const teacherSeedEvaluation = evaluateModel(filteredData, teacherSeed);
+    const teacherSeedEvaluation = evaluateModel(TRAINING_DATA, teacherSeed);
     if (teacherSeedEvaluation.objective > bestObjective) {
       bestModel = teacherSeed;
       bestEvaluation = teacherSeedEvaluation;
@@ -2312,7 +2849,7 @@ export default function Home() {
           pattern: raw.pattern / sum,
           threshold: raw.threshold,
         };
-        const candidateEvaluation = evaluateModel(filteredData, candidate);
+        const candidateEvaluation = evaluateModel(TRAINING_DATA, candidate);
         if (candidateEvaluation.objective > bestObjective) {
           bestObjective = candidateEvaluation.objective;
           bestModel = candidate;
@@ -2346,7 +2883,7 @@ export default function Home() {
       {
         id: `run-${Date.now()}`,
         completedAt: new Date().toISOString(),
-        range: { ...range },
+        range: { start: TRAINING_START, end: TRAINING_END },
         epochs: epochsCompleted,
         improved,
         validationReturn: bestEvaluation.validationResult.strategyReturn,
@@ -2364,11 +2901,12 @@ export default function Home() {
         ? `Checkpoint saved / ${percent(bestEvaluation.validationResult.alpha)} holdout alpha`
         : "Training complete / current checkpoint remains stronger",
     );
-  }, [filteredData, model, range, training, trainingEpoch]);
+  }, [model, training, trainingEpoch]);
 
   const resetPaper = () => {
     setPaper({ ...INITIAL_PAPER, orders: [], equityHistory: [] });
-    setPaperPrice(MARKET_DATA[MARKET_DATA.length - 1].close);
+    setPaperBarIndex(0);
+    setPaperPrice(PAPER_STREAM[0]?.open ?? MARKET_DATA[MARKET_DATA.length - 1].close);
     setPaperActive(false);
     setReplayMode(false);
     setToast("Paper account reset to $25,000");
@@ -2388,11 +2926,131 @@ export default function Home() {
     { label: "Candle confirmation", value: latestFactors.pattern, weight: model.pattern, color: "violet" },
   ];
 
+  const accountInitials = (accountUser?.username ?? "SF").slice(0, 2).toUpperCase();
+
+  if (accountStatus === "loading") {
+    return (
+      <main className="gateway-shell" aria-busy="true">
+        <div className="gateway-loading" role="status" aria-live="polite">
+          <span className="brand-mark gateway-brand-mark" aria-hidden="true" />
+          <span className="skeleton-line headline" />
+          <span className="skeleton-line medium" />
+          <div className="gateway-loading-grid"><i /><i /></div>
+          <small>Opening your private workspace...</small>
+        </div>
+      </main>
+    );
+  }
+
+  if (accountStatus === "anonymous") {
+    return (
+      <main className="gateway-shell">
+        <header className="gateway-header">
+          <a className="brand" href="#account" aria-label="Signal Forge account">
+            <span className="brand-mark" aria-hidden="true" />
+            <span>Signal <b>Forge</b></span>
+            <em>LAB</em>
+          </a>
+          <button className="theme-toggle" type="button" onClick={() => setTheme((current) => current === "dark" ? "light" : "dark")} aria-label="Toggle color theme">
+            {theme === "dark" ? <Sun size={16} /> : <Moon size={16} />}
+          </button>
+        </header>
+        <section className="auth-gateway" id="account">
+          <div className="auth-story">
+            <span className="view-kicker">PRIVATE RESEARCH WORKSPACE</span>
+            <h1>One account. One isolated trading lab.</h1>
+            <p>Your model weights, checkpoints, backtest dates, paper portfolio, and order history follow your username instead of staying on one browser.</p>
+            <div className="auth-proof-grid">
+              <div><LockKeyhole size={17} /><span><strong>Protected session</strong><small>HTTP-only cookie and throttled sign-in</small></span></div>
+              <div><Database size={17} /><span><strong>Account-backed state</strong><small>No trading state stored in localStorage</small></span></div>
+              <div><FlaskConical size={17} /><span><strong>Sandbox first</strong><small>Fake money and simulated AAPL data only</small></span></div>
+            </div>
+          </div>
+          <form className="auth-card" onSubmit={submitAuth}>
+            <div className="auth-card-heading">
+              <span className="auth-icon"><UserRound size={19} /></span>
+              <div><span>{authMode === "login" ? "Welcome back" : "Create your lab"}</span><h2>{authMode === "login" ? "Sign in" : "Create account"}</h2></div>
+            </div>
+            <div className="auth-tabs" role="tablist" aria-label="Account action">
+              <button className={authMode === "login" ? "active" : ""} type="button" onClick={() => { setAuthMode("login"); setAuthError(""); }}>Sign in</button>
+              <button className={authMode === "register" ? "active" : ""} type="button" onClick={() => { setAuthMode("register"); setAuthError(""); }}>New account</button>
+            </div>
+            <label className="auth-field" htmlFor="auth-username">
+              <span>Username</span>
+              <input id="auth-username" name="username" autoComplete="username" minLength={3} maxLength={24} pattern="[A-Za-z0-9][A-Za-z0-9_-]{2,23}" required value={authUsername} onChange={(event) => setAuthUsername(event.target.value)} placeholder="your_username" />
+            </label>
+            <label className="auth-field" htmlFor="auth-password">
+              <span>Password</span>
+              <input id="auth-password" name="password" type="password" autoComplete={authMode === "login" ? "current-password" : "new-password"} minLength={10} maxLength={128} required value={authPassword} onChange={(event) => setAuthPassword(event.target.value)} placeholder="10+ characters" />
+            </label>
+            {authError && <div className="auth-error" role="alert"><Info size={14} /> {authError}</div>}
+            <button className="primary-button auth-submit" type="submit" disabled={authBusy}>
+              {authBusy ? <RefreshCw className="spin" size={15} /> : <LockKeyhole size={15} />}
+              {authBusy ? "Securing session..." : authMode === "login" ? "Open workspace" : "Create private workspace"}
+            </button>
+            <small className="auth-disclaimer">No email verification yet. Use a unique password; account recovery and MFA are not available in this prototype.</small>
+          </form>
+        </section>
+      </main>
+    );
+  }
+
+  if (workspaceMode === null) {
+    return (
+      <main className="gateway-shell mode-shell">
+        <header className="gateway-header">
+          <a className="brand" href="#mode" aria-label="Signal Forge mode selection"><span className="brand-mark" aria-hidden="true" /><span>Signal <b>Forge</b></span><em>LAB</em></a>
+          <div className="gateway-account-actions">
+            <button className="theme-toggle" type="button" onClick={() => setTheme((current) => current === "dark" ? "light" : "dark")} aria-label="Toggle color theme">{theme === "dark" ? <Sun size={16} /> : <Moon size={16} />}</button>
+            <span className="gateway-user"><i>{accountInitials}</i>{accountUser?.username}</span>
+            <button className="icon-text-button" type="button" onClick={() => void signOut()}><LogOut size={14} /> Sign out</button>
+          </div>
+        </header>
+        <section className="mode-gateway" id="mode">
+          <div className="mode-heading"><span className="view-kicker">CHOOSE AN ENVIRONMENT</span><h1>Where do you want to work?</h1><p>Mode is selected fresh on every visit. Your account data stays attached to your account.</p></div>
+          <div className="mode-grid">
+            <button className="mode-card sandbox" type="button" onClick={() => setWorkspaceMode("sandbox")}>
+              <span className="mode-card-icon"><FlaskConical size={23} /></span><small>READY</small><h2>Sandbox</h2><p>Train on isolated 2023 data, backtest 2024 onward, and replay five-minute paper trading with fake money.</p><strong>Enter sandbox <ArrowUpRight size={15} /></strong>
+            </button>
+            <button className="mode-card live" type="button" onClick={() => setWorkspaceMode("live")}>
+              <span className="mode-card-icon"><Radio size={23} /></span><small>EMPTY</small><h2>Live</h2><p>A clean broker workspace with no connection, market feed, positions, orders, or real-money controls.</p><strong>Open empty live mode <ArrowUpRight size={15} /></strong>
+            </button>
+          </div>
+          <div className="mode-footnote"><ShieldCheck size={14} /> Sandbox activity can never submit a real order.</div>
+        </section>
+      </main>
+    );
+  }
+
+  if (workspaceMode === "live") {
+    return (
+      <main className="app-shell refined-shell live-empty-shell">
+        <header className="topbar refined-topbar live-empty-topbar">
+          <a className="brand" href="#live"><span className="brand-mark" aria-hidden="true" /><span>Signal <b>Forge</b></span><em>LIVE</em></a>
+          <div className="live-mode-pill"><span /> Live workspace</div>
+          <div className="top-actions">
+            <button className="theme-toggle" type="button" onClick={() => setTheme((current) => current === "dark" ? "light" : "dark")} aria-label="Toggle color theme">{theme === "dark" ? <Sun size={16} /> : <Moon size={16} />}</button>
+            <button className="icon-text-button" type="button" onClick={() => setWorkspaceMode(null)}>Switch mode</button>
+            <button className="avatar avatar-button" type="button" onClick={() => void signOut()} title={`Sign out ${accountUser?.username}`}>{accountInitials}</button>
+          </div>
+        </header>
+        <section className="live-empty" id="live">
+          <div className="live-empty-orbit"><Radio size={27} /></div>
+          <span className="view-kicker">NO BROKER CONNECTED</span>
+          <h1>Live mode is intentionally empty.</h1>
+          <p>No live quote feed, brokerage credentials, positions, or order route has been configured. Nothing here can place a trade.</p>
+          <div className="live-empty-stats"><div><span>Buying power</span><strong>--</strong></div><div><span>Open positions</span><strong>0</strong></div><div><span>Orders</span><strong>0</strong></div></div>
+          <button className="primary-button" type="button" onClick={() => setWorkspaceMode("sandbox")}><FlaskConical size={15} /> Go to Sandbox</button>
+        </section>
+      </main>
+    );
+  }
+
   return (
     <main className="app-shell refined-shell">
       <header className="topbar refined-topbar">
         <a className="brand" href="#workspace" aria-label="Signal Forge home">
-          <span className="brand-mark"><Activity size={17} strokeWidth={2.1} /></span>
+          <span className="brand-mark" aria-hidden="true" />
           <span>Signal <b>Forge</b></span>
           <em>SIM</em>
         </a>
@@ -2407,12 +3065,15 @@ export default function Home() {
           <button id="tab-paper" role="tab" aria-selected={activeView === "paper"} aria-controls="panel-paper" className={activeView === "paper" ? "active" : ""} type="button" onClick={() => setActiveView("paper")}>
             <BriefcaseBusiness size={15} /> <span>Portfolio</span>{paperActive && <i className="nav-live-dot" />}
           </button>
+          <button id="tab-guide" role="tab" aria-selected={activeView === "guide"} aria-controls="panel-guide" className={activeView === "guide" ? "active" : ""} type="button" onClick={() => setActiveView("guide")}>
+            <BookOpenCheck size={15} /> <span>Guide</span>
+          </button>
         </nav>
 
         <div className="top-actions">
-          <div className={`sync-pill ${syncStatus}`} title="Cloud checkpoint status">
+          <div className={`sync-pill ${syncStatus}`} title="Account storage status">
             {syncStatus === "offline" ? <CloudOff size={14} /> : syncStatus === "saving" ? <Save size={14} /> : <Cloud size={14} />}
-            <span>{syncStatus === "loading" ? "Loading" : syncStatus === "saving" ? "Saving" : syncStatus === "offline" ? "Offline" : "Saved"}</span>
+            <span>{syncStatus === "loading" ? "Loading" : syncStatus === "saving" ? "Saving" : syncStatus === "offline" ? "Offline" : "Account saved"}</span>
           </div>
           <div className="market-status refined-market-status">
             <span className={marketClock.isOpen ? "status-dot live" : "status-dot"} />
@@ -2435,7 +3096,7 @@ export default function Home() {
             <BriefcaseBusiness size={15} />
             {money(paperValue)}
           </button>
-          <div className="avatar" aria-label="Paper trading account">AS</div>
+          <button className="avatar avatar-button" type="button" aria-label={`Account ${accountUser?.username}; click to change mode`} title={`${accountUser?.username} / change mode`} onClick={() => setWorkspaceMode(null)}>{accountInitials}</button>
         </div>
       </header>
 
@@ -2458,7 +3119,7 @@ export default function Home() {
                   {percent(dayMove, 2)}
                 </span>
               </div>
-              <p>30-minute ensemble / ORB, pullbacks, squeezes, levels / flat by 4:00 PM</p>
+              <p>Five-minute ensemble / ORB, pullbacks, squeezes, levels / flat by 4:00 PM</p>
             </div>
           </div>
 
@@ -2474,7 +3135,7 @@ export default function Home() {
           <div className="range-builder">
             <div className="range-builder-title">
               <span><CalendarRange size={17} /></span>
-              <div><strong>Replay history</strong><small>Choose a clean test window</small></div>
+              <div><strong>Replay unseen years</strong><small>2024 onward / never used for training</small></div>
             </div>
             <div className="range-fields">
               <label htmlFor="start-date">
@@ -2482,7 +3143,7 @@ export default function Home() {
                 <input
                   id="start-date"
                   type="date"
-                  min={DATA_START}
+                  min={BACKTEST_MIN}
                   max={DATA_END}
                   value={draftStart}
                   onChange={(event) => setDraftStart(event.target.value)}
@@ -2494,7 +3155,7 @@ export default function Home() {
                 <input
                   id="end-date"
                   type="date"
-                  min={DATA_START}
+                  min={BACKTEST_MIN}
                   max={DATA_END}
                   value={draftEnd}
                   onChange={(event) => setDraftEnd(event.target.value)}
@@ -2581,7 +3242,7 @@ export default function Home() {
               <span><TrendingUp size={14} /> {result.longEntries} longs</span>
               <span><TrendingDown size={14} /> {result.shortEntries} shorts</span>
               <span><Target size={14} /> {latestDecision.regime.toLowerCase()} / {latestDecision.confluence} confirmations</span>
-              <span><ShieldCheck size={14} /> Fees and slippage included</span>
+              <span><ShieldCheck size={14} /> Next-bar fills / fees / spread / slippage</span>
             </div>
 
             {isRunning ? (
@@ -2628,8 +3289,12 @@ export default function Home() {
                   <div><span>Positive weeks</span><strong>{(result.positiveWeekRate * 100).toFixed(0)}%</strong></div>
                   <div><span>Average week</span><strong>{percent(result.averageWeekReturn)}</strong></div>
                   <div><span>Trades per day</span><strong>{result.tradesPerDay.toFixed(1)}</strong></div>
-                  <div><span>Average hold</span><strong>{Math.round(result.averageHoldBars * 30)}m</strong></div>
+                  <div><span>Average hold</span><strong>{Math.round(result.averageHoldBars * BAR_MINUTES)}m</strong></div>
                   <div><span>Closed positions</span><strong>{result.roundTrips}</strong></div>
+                  <div><span>Regulatory fees</span><strong>{money(result.totalFees, 2)}</strong></div>
+                  <div><span>Estimated slippage</span><strong>{money(result.totalSlippage, 2)}</strong></div>
+                  <div><span>Average modeled spread</span><strong>{money(result.averageSpread, 3)}</strong></div>
+                  <div><span>Execution interval</span><strong>{BAR_MINUTES} minutes</strong></div>
                 </div>
               </article>
             </div>}
@@ -2641,7 +3306,7 @@ export default function Home() {
               </summary>
               <div className="table-wrap refined-table">
                 <table>
-                  <thead><tr><th>Date</th><th>Action</th><th>Fill price</th><th>Shares</th><th>Profit / loss</th><th>Confidence</th><th>Why</th></tr></thead>
+                  <thead><tr><th>Date</th><th>Action</th><th>Fill price</th><th>Shares</th><th>Fees</th><th>Profit / loss</th><th>Confidence</th><th>Why</th></tr></thead>
                   <tbody>
                     {result.trades.slice().reverse().slice(0, 50).map((trade) => (
                       <tr key={trade.id}>
@@ -2649,6 +3314,7 @@ export default function Home() {
                         <td><span className={trade.side === "BUY" || trade.side === "COVER" ? "side-tag buy" : "side-tag sell"}>{trade.side}</span></td>
                         <td>{money(trade.price, 2)}</td>
                         <td>{trade.shares}</td>
+                        <td>{money(trade.fees, 2)}</td>
                         <td className={trade.pnl === null ? "muted-cell" : trade.pnl >= 0 ? "positive-cell" : "negative-cell"}>{trade.pnl === null ? "Entry" : money(trade.pnl)}</td>
                         <td>{trade.confidence}%</td>
                         <td>{trade.reason}</td>
@@ -2671,7 +3337,7 @@ export default function Home() {
                   <div>
                     <span className="view-kicker">LEARNING LOOP</span>
                     <h2>Teacher-guided, judged out of sample</h2>
-                    <p>The first 72% teaches the policy. The final 28% decides whether a checkpoint is worth saving.</p>
+                    <p>Only 2023 can train the policy. Its first 72% teaches; its final 28% validates. Backtests start in 2024 and never enter this loop.</p>
                   </div>
                   <span className={validationResult.alpha > 0 ? "training-status success" : "training-status"}>
                     {validationResult.alpha > 0 ? <Check size={14} /> : <Target size={14} />}
@@ -2748,7 +3414,7 @@ export default function Home() {
                     <div>
                       <span className="view-kicker">HINDSIGHT TEACHER</span>
                       <h3>Shows the best direction after the fact</h3>
-                      <p>For each training candle, the teacher compares the best long and short excursion over the next five candles. Those future-aware labels guide training only.</p>
+                      <p>For each 2023 candle, the teacher compares the best long and short excursion over the next five five-minute candles. Those future-aware labels guide training only.</p>
                     </div>
                     <div className="teacher-score">
                       <span>Policy agreement</span>
@@ -2759,13 +3425,13 @@ export default function Home() {
                   <article className="split-card">
                     <div className="split-card-heading">
                       <div><BookOpenCheck size={17} /><span>Walk-forward split</span></div>
-                      <small>{sessionCount} days / {filteredData.length} candles</small>
+                      <small>{trainingSessionCount} days / {TRAINING_DATA.length} candles / 2023 only</small>
                     </div>
                     <div className="split-rail" aria-label="Training and holdout split">
-                      <span style={{ width: `${filteredData.length ? trainingSplitCount / filteredData.length * 100 : 72}%` }}>Teacher training</span>
+                      <span style={{ width: `${TRAINING_DATA.length ? trainingSplitCount / TRAINING_DATA.length * 100 : 72}%` }}>Teacher training</span>
                       <span>Unseen holdout</span>
                     </div>
-                    <p>The model studies the earlier period. The later period stays hidden until scoring, which reduces backtest overfitting.</p>
+                    <p>The split is made on whole trading days with no overlapping candles. The selected 2024+ backtest range remains completely separate.</p>
                   </article>
                 </div>}
 
@@ -2807,7 +3473,7 @@ export default function Home() {
               <div>
                 <span className="view-kicker">PORTFOLIO SIMULATOR</span>
                 <h2>Practice long and short with fake money</h2>
-                <p>Cash, positions, P&amp;L, and every order are saved to your account.</p>
+                <p>The same five-minute policy, next-bar fills, costs, and risk rules as Backtest. Everything is saved to your account.</p>
               </div>
               <span className={paperActive ? "bot-state armed" : "bot-state"}><Radio size={12} /> {paperActive ? (marketClock.isOpen || replayMode ? "Running" : "Armed for open") : "Stopped"}</span>
             </div>
@@ -2855,14 +3521,23 @@ export default function Home() {
                     {paperActive ? "Pause paper bot" : "Start paper bot"}
                   </button>
                   {!marketClock.isOpen && (
-                    <button className={replayMode ? "secondary-button active" : "secondary-button"} type="button" onClick={() => { setReplayMode((active) => !active); setPaperActive(true); }}>
+                    <button className={replayMode ? "secondary-button active" : "secondary-button"} type="button" onClick={() => {
+                      if (!replayMode && paperBarIndex >= PAPER_STREAM.length) {
+                        setPaper({ ...INITIAL_PAPER });
+                        setPaperBarIndex(0);
+                        setPaperPrice(PAPER_STREAM[0]?.open ?? paperPrice);
+                      }
+                      setReplayMode((active) => !active);
+                      setPaperActive(true);
+                    }}>
                       <Activity size={15} /> {replayMode ? "Stop replay" : "Replay a session"}
                     </button>
                   )}
                   <button className="secondary-button reset-paper" type="button" onClick={resetPaper}><RotateCcw size={15} /> Reset</button>
                 </div>
                 <div className="automation-rules">
-                  <div><span>Decision interval</span><strong>Every simulated 30m candle</strong></div>
+                  <div><span>Decision interval</span><strong>Every five-minute candle</strong></div>
+                  <div><span>Replay progress</span><strong>{Math.min(paperBarIndex, PAPER_STREAM.length)} / {PAPER_STREAM.length} candles</strong></div>
                   <div><span>Position policy</span><strong>2–5 confirmations / long or short</strong></div>
                   <div><span>Risk exits</span><strong>ATR stop / 1.35–2.35R target</strong></div>
                   <div><span>Overnight risk</span><strong>Always flat by 4:00 PM</strong></div>
@@ -2888,13 +3563,95 @@ export default function Home() {
                       <div className="paper-order" key={order.id}>
                         <span className={order.side === "BUY" || order.side === "COVER" ? "order-icon buy" : "order-icon sell"}>{order.side === "BUY" || order.side === "COVER" ? <ArrowUpRight size={15} /> : <ArrowDownRight size={15} />}</span>
                         <div><strong>{order.side} {order.shares} AAPL</strong><small>{order.note} / {order.time}</small></div>
-                        <span>{money(order.price, 2)}</span>
+                        <span>{money(order.price, 2)}<small>{money(order.fees, 2)} fees</small></span>
                       </div>
                     ))
                   )}
                 </div>
                 <div className="paper-disclosure"><Database size={14} /> Portfolio and order history are saved. Prices and fills remain simulated.</div>
               </aside>}
+            </div>
+          </section>
+        )}
+
+        {activeView === "guide" && (
+          <section className="panel focused-workspace guide-workspace" id="panel-guide" role="tabpanel" aria-labelledby="tab-guide">
+            <div className="workspace-heading guide-heading">
+              <div>
+                <span className="view-kicker">SYSTEM GUIDE</span>
+                <h2>How Signal Forge actually works</h2>
+                <p>The exact data boundaries, learning loop, order timing, cost assumptions, account model, and limits—without marketing language.</p>
+              </div>
+              <span className="training-status"><ShieldCheck size={14} /> Sandbox only</span>
+            </div>
+
+            <div className="guide-flow" aria-label="Trading system sequence">
+              <div><span>01</span><strong>Five-minute candle closes</strong><small>Only known OHLCV and indicators</small></div>
+              <i />
+              <div><span>02</span><strong>Policy scores the setup</strong><small>Long, short, or no action</small></div>
+              <i />
+              <div><span>03</span><strong>Next candle executes</strong><small>Open price plus modeled costs</small></div>
+              <i />
+              <div><span>04</span><strong>Risk engine manages it</strong><small>Stop, target, reversal, time, close</small></div>
+            </div>
+
+            <div className="guide-grid">
+              <article>
+                <span className="guide-number">01</span>
+                <h3>Separate years prevent leakage</h3>
+                <p><b>Training is fixed to Jan–Dec 2023.</b> Whole trading days are split 72/28 into teacher training and unseen validation. The date picker begins in 2024, so a backtest candle cannot become a training example.</p>
+                <div className="guide-boundary"><span>2023</span><strong>Train + validate</strong><i /><span>2024–2026</span><strong>Backtest only</strong></div>
+              </article>
+
+              <article>
+                <span className="guide-number">02</span>
+                <h3>The teacher is training-only</h3>
+                <p>During training, a hindsight teacher labels whether long, short, or flat would have been best over the next five candles (25 minutes). Random nearby weight sets are evaluated, and only a better validation checkpoint replaces the saved model. Backtest and Sandbox never receive those future labels.</p>
+              </article>
+
+              <article>
+                <span className="guide-number">03</span>
+                <h3>Eleven causal signal families</h3>
+                <p>EMA/ADX trend, RSI, momentum, volatility, VWAP, relative volume, opening-range breakout, VWAP/EMA pullback, Bollinger squeeze, key levels, and candle confirmation contribute weighted values. Market regime and confluence adjust the final threshold.</p>
+              </article>
+
+              <article>
+                <span className="guide-number">04</span>
+                <h3>Backtest and Sandbox share execution</h3>
+                <p>Both read one five-minute candle at a time, call the same scoring and pending-entry functions, and fill a new signal only at the next candle’s open. Both use the same risk sizing, eight-entry daily cap, cooldown, 1.8% daily lock, ATR stop, target, reversal, time stop, and forced 4:00 PM exit.</p>
+              </article>
+
+              <article className="guide-wide">
+                <span className="guide-number">05</span>
+                <h3>What a simulated fill includes</h3>
+                <div className="cost-assumption-grid">
+                  <div><span>Broker commission</span><strong>$0.00</strong><small>Assumes commission-free U.S. online stock orders</small></div>
+                  <div><span>SEC sale fee</span><strong>$20.60 / $1M</strong><small>Applied to sells and short sales</small></div>
+                  <div><span>FINRA TAF</span><strong>$0.000195 / share</strong><small>Sale-side, capped at $9.79</small></div>
+                  <div><span>CAT fee</span><strong>$0.000003 / share</strong><small>Modeled on every side</small></div>
+                  <div><span>Spread</span><strong>Dynamic</strong><small>Wider near open/close and in thin/volatile bars</small></div>
+                  <div><span>Market impact</span><strong>Dynamic</strong><small>Adverse move based on order participation and volatility</small></div>
+                </div>
+                <p className="guide-note">Targets are treated as limit fills; market and stop orders pay adverse spread and impact. Taxes, borrow availability, hard-to-borrow fees, payment-for-order-flow differences, halts, partial fills, and broker-specific pricing are not modeled.</p>
+              </article>
+
+              <article>
+                <span className="guide-number">06</span>
+                <h3>Your account owns the state</h3>
+                <p>Usernames are normalized. Passwords are salted and slow-hashed; raw passwords are never stored. Session tokens are random, only their hashes enter the database, and the browser receives a secure HTTP-only cookie. Model, checkpoints, selected dates, portfolio, and orders are stored under the signed-in account.</p>
+              </article>
+
+              <article>
+                <span className="guide-number">07</span>
+                <h3>What “Live” means today</h3>
+                <p>Live mode is deliberately blank. It has no quote vendor, broker API, credentials, positions, or order route. Sandbox uses synthetic AAPL-like data, not historical AAPL candles, and cannot prove future profitability or place a real trade.</p>
+              </article>
+            </div>
+
+            <div className="guide-actions">
+              <button className="primary-button" type="button" onClick={() => setActiveView("chart")}><BarChart3 size={15} /> Open Backtest</button>
+              <button className="secondary-button" type="button" onClick={() => setWorkspaceMode(null)}>Change mode</button>
+              <button className="text-button" type="button" onClick={() => void signOut()}><LogOut size={14} /> Sign out {accountUser?.username}</button>
             </div>
           </section>
         )}

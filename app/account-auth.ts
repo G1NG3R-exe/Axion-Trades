@@ -1,5 +1,5 @@
 import { env } from "cloudflare:workers";
-import { ensureAccountSchema, getD1 } from "../db";
+import { getD1 } from "../db";
 
 export type AccountUser = {
   id: string;
@@ -11,9 +11,7 @@ export type AccountSession = {
   tokenHash: string;
 };
 
-// Cloudflare Workers WebCrypto rejects PBKDF2 counts above 100,000.
-// Use the runtime ceiling together with a unique salt and server-held pepper.
-export const PASSWORD_ITERATIONS = 100_000;
+export const PASSWORD_ITERATIONS = 600_000;
 export const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7;
 
 const AUTH_WINDOW_MS = 15 * 60 * 1000;
@@ -117,10 +115,10 @@ export function normalizeUsername(value: unknown) {
 
 export function credentialError(username: string, password: unknown) {
   if (!/^[a-z0-9][a-z0-9_-]{2,23}$/.test(username)) {
-    return "Use 3-24 lowercase letters, numbers, underscores, or hyphens.";
+    return "Use 3–24 lowercase letters, numbers, underscores, or hyphens.";
   }
-  if (typeof password !== "string" || password.length < 8 || password.length > 128) {
-    return "Use a password between 8 and 128 characters.";
+  if (typeof password !== "string" || password.length < 10 || password.length > 128) {
+    return "Use a password between 10 and 128 characters.";
   }
   return null;
 }
@@ -173,7 +171,6 @@ export function isTrustedWrite(request: Request) {
 }
 
 export async function createSession(request: Request, user: AccountUser) {
-  await ensureAccountSchema();
   const d1 = getD1();
   const token = randomToken(32);
   const tokenHash = await sha256(token);
@@ -187,7 +184,6 @@ export async function createSession(request: Request, user: AccountUser) {
 }
 
 export async function getAccountSession(request: Request): Promise<AccountSession | null> {
-  await ensureAccountSchema();
   const token = readCookie(request, cookieName(request));
   if (!token || token.length < 32 || token.length > 128) return null;
   const tokenHash = await sha256(token);
@@ -205,7 +201,6 @@ export async function getAccountSession(request: Request): Promise<AccountSessio
 }
 
 export async function deleteSession(tokenHash: string) {
-  await ensureAccountSchema();
   await getD1().prepare("DELETE FROM account_sessions WHERE token_hash = ?").bind(tokenHash).run();
 }
 
@@ -215,7 +210,6 @@ async function rateLimitKey(request: Request, username: string) {
 }
 
 export async function authRateLimited(request: Request, username: string) {
-  await ensureAccountSchema();
   const keyHash = await rateLimitKey(request, username);
   const row = await getD1()
     .prepare("SELECT attempts, window_started_at, blocked_until FROM auth_rate_limits WHERE key_hash = ? LIMIT 1")
@@ -225,7 +219,6 @@ export async function authRateLimited(request: Request, username: string) {
 }
 
 export async function recordAuthFailure(request: Request, username: string) {
-  await ensureAccountSchema();
   const d1 = getD1();
   const keyHash = await rateLimitKey(request, username);
   const now = Date.now();
@@ -252,7 +245,6 @@ export async function recordAuthFailure(request: Request, username: string) {
 }
 
 export async function clearAuthFailures(request: Request, username: string) {
-  await ensureAccountSchema();
   const keyHash = await rateLimitKey(request, username);
   await getD1().prepare("DELETE FROM auth_rate_limits WHERE key_hash = ?").bind(keyHash).run();
 }
