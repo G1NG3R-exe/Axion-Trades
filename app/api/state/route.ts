@@ -1,5 +1,6 @@
 import { getAccountSession, isTrustedWrite, noStoreJson } from "../../account-auth";
 import { getD1 } from "../../../db";
+import { proxySitesRequest, usesSitesProxy } from "../sites-proxy";
 
 export const dynamic = "force-dynamic";
 
@@ -14,6 +15,7 @@ function routeError(error: unknown) {
 }
 
 export async function GET(request: Request) {
+  if (usesSitesProxy()) return proxySitesRequest(request);
   try {
     const session = await getAccountSession(request);
     if (!session) return noStoreJson({ error: "Sign in is required." }, { status: 401 });
@@ -33,6 +35,7 @@ export async function GET(request: Request) {
 }
 
 export async function PUT(request: Request) {
+  if (usesSitesProxy()) return proxySitesRequest(request);
   if (!isTrustedWrite(request)) return noStoreJson({ error: "Request origin was rejected." }, { status: 403 });
   try {
     const session = await getAccountSession(request);
@@ -68,6 +71,7 @@ export async function PUT(request: Request) {
 }
 
 export async function DELETE(request: Request) {
+  if (usesSitesProxy()) return proxySitesRequest(request);
   if (!isTrustedWrite(request)) return noStoreJson({ error: "Request origin was rejected." }, { status: 403 });
   try {
     const session = await getAccountSession(request);

@@ -1,4 +1,4 @@
-const DEFAULT_SITES_BACKEND = "https://axion-trades-aapl-lab.alexshmulevich424.chatgpt.site";
+const DEFAULT_SITES_BACKEND = "https://signal-forge-aapl-lab.alexshmulevich424.chatgpt.site";
 
 export function usesSitesProxy() {
   return process.env.VERCEL === "1";
@@ -78,7 +78,7 @@ export async function proxySitesRequest(request: Request) {
       headers: responseHeaders,
     });
   } catch (error) {
-    console.error("axion-trades account proxy failed", error);
+    console.error("Signal Forge account proxy failed", error);
     return noStoreJson({ error: "The account service is temporarily unavailable." }, 503);
   }
 }

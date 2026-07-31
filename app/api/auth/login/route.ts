@@ -11,10 +11,12 @@ import {
   verifyPassword,
 } from "../../../account-auth";
 import { getD1 } from "../../../../db";
+import { proxySitesRequest, usesSitesProxy } from "../../sites-proxy";
 
 export const dynamic = "force-dynamic";
 
 export async function POST(request: Request) {
+  if (usesSitesProxy()) return proxySitesRequest(request);
   if (!isTrustedWrite(request)) return noStoreJson({ error: "Request origin was rejected." }, { status: 403 });
 
   try {

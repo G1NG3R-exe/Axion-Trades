@@ -66,17 +66,23 @@ test("builds the complete Signal Forge application", async () => {
 });
 
 test("serves the interface directly on Vercel without a browser redirect", async () => {
-  const [vercel, nextConfig] = await Promise.all([
+  const [vercel, nextConfig, sitesProxy, sessionRoute] = await Promise.all([
     source("vercel.json"),
     source("next.config.ts"),
+    source("app/api/sites-proxy.ts"),
+    source("app/api/auth/session/route.ts"),
   ]);
 
   const parsed = JSON.parse(vercel);
   assert.equal(parsed.framework, "nextjs");
   assert.equal(parsed.redirects, undefined);
   assert.doesNotMatch(nextConfig, /async redirects/);
-  assert.match(nextConfig, /source: "\/api\/:path\*"/);
-  assert.match(nextConfig, /beforeFiles/);
+  assert.doesNotMatch(nextConfig, /async rewrites/);
+  assert.match(sitesProxy, /OAI-Sites-Authorization/);
+  assert.match(sitesProxy, /SIGNAL_FORGE_SITES_TOKEN/);
+  assert.match(sitesProxy, /getSetCookie/);
+  assert.match(sitesProxy, /isTrustedProxyWrite/);
+  assert.match(sessionRoute, /usesSitesProxy/);
 });
 
 test("includes durable per-user checkpoint storage", async () => {
