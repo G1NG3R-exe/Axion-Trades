@@ -71,7 +71,8 @@ test("includes durable per-user checkpoint storage", async () => {
   assert.match(migration, /CREATE TABLE `accounts`/);
   assert.match(migration, /CREATE TABLE `account_sessions`/);
   assert.match(migration, /CREATE TABLE `account_states`/);
-  assert.match(auth, /PASSWORD_ITERATIONS = 600_000/);
+  assert.match(auth, /PASSWORD_ITERATIONS = 100_000/);
+  assert.match(auth, /rejects PBKDF2 counts above 100,000/);
   assert.match(auth, /password.length < 8/);
   assert.match(auth, /HttpOnly; SameSite=Strict/);
   assert.match(auth, /authRateLimited/);

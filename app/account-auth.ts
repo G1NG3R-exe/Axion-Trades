@@ -11,7 +11,9 @@ export type AccountSession = {
   tokenHash: string;
 };
 
-export const PASSWORD_ITERATIONS = 600_000;
+// Cloudflare Workers WebCrypto rejects PBKDF2 counts above 100,000.
+// Use the runtime ceiling together with a unique salt and server-held pepper.
+export const PASSWORD_ITERATIONS = 100_000;
 export const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7;
 
 const AUTH_WINDOW_MS = 15 * 60 * 1000;
