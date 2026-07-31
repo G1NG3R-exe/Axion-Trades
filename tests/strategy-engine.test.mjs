@@ -16,6 +16,7 @@ async function loadEngine() {
 globalThis.__signalForgeEngine = {
   INITIAL_MODEL,
   INITIAL_PAPER,
+  createInitialPaper,
   MARKET_DATA,
   PAPER_STREAM,
   PAPER_STARTING_CASH,
@@ -66,6 +67,18 @@ test("paper replay and backtest remain the same five-minute executor", () => {
 
   assert.ok(Math.abs(paperFinal - backtest.finalValue) < 1e-7, `${paperFinal} !== ${backtest.finalValue}`);
   assert.ok(paper.entriesThisSession <= engine.MAX_ENTRIES_PER_SESSION);
+});
+
+test("custom paper balances preserve executor parity", () => {
+  const startingCash = 1_000;
+  const session = engine.PAPER_STREAM;
+  const backtest = engine.runBacktest(session, engine.INITIAL_MODEL, startingCash);
+  let paper = engine.createInitialPaper(startingCash);
+  for (const bar of session) paper = engine.advancePaperAccount(paper, bar, engine.INITIAL_MODEL);
+  const paperFinal = paper.cash + paper.shares * session.at(-1).close;
+
+  assert.equal(paper.dailyStartEquity > 0, true);
+  assert.ok(Math.abs(paperFinal - backtest.finalValue) < 1e-7, `${paperFinal} !== ${backtest.finalValue}`);
 });
 
 test("risk and teacher controls remain bounded", () => {

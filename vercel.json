@@ -1,12 +1,5 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": "nextjs",
-  "buildCommand": "next build",
-  "redirects": [
-    {
-      "source": "/:path*",
-      "destination": "https://signal-forge-aapl-lab.alexshmulevich424.chatgpt.site/:path*",
-      "permanent": false
-    }
-  ]
+  "buildCommand": "next build"
 }

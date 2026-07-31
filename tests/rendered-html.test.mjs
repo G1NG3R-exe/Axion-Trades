@@ -33,6 +33,14 @@ test("builds the complete Signal Forge application", async () => {
   assert.match(page, /SYSTEM GUIDE/);
   assert.match(page, /Live mode is intentionally empty/);
   assert.match(page, /Create private workspace/);
+  assert.match(page, /WORKSPACE SETTINGS/);
+  assert.match(page, /Apply balance &amp; reset portfolio/);
+  assert.match(page, /YOUR ACCOUNT/);
+  assert.match(page, /Profile photo style/);
+  assert.match(page, /Connect payment/);
+  assert.match(page, /Open account menu/);
+  assert.match(page, /paperStartingCash/);
+  assert.match(page, /function createInitialPaper/);
   assert.match(page, /Opening range breakout/);
   assert.match(page, /VWAP \/ EMA pullback/);
   assert.match(page, /Bollinger squeeze/);
@@ -52,7 +60,23 @@ test("builds the complete Signal Forge application", async () => {
   assert.doesNotMatch(layout, /next\/font/);
   assert.match(styles, /light-first liquid glass/);
   assert.match(styles, /backdrop-filter: blur\(28px\) saturate\(165%\)/);
+  assert.match(styles, /account menu, profile, and focused settings/);
+  assert.match(styles, /profile-menu-enter/);
   assert.doesNotMatch(page, /SkeletonPreview/);
+});
+
+test("serves the interface directly on Vercel without a browser redirect", async () => {
+  const [vercel, nextConfig] = await Promise.all([
+    source("vercel.json"),
+    source("next.config.ts"),
+  ]);
+
+  const parsed = JSON.parse(vercel);
+  assert.equal(parsed.framework, "nextjs");
+  assert.equal(parsed.redirects, undefined);
+  assert.doesNotMatch(nextConfig, /async redirects/);
+  assert.match(nextConfig, /source: "\/api\/:path\*"/);
+  assert.match(nextConfig, /beforeFiles/);
 });
 
 test("includes durable per-user checkpoint storage", async () => {

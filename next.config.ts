@@ -1,15 +1,20 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  async redirects() {
+  async rewrites() {
     if (!process.env.VERCEL) return [];
-    return [
-      {
-        source: "/:path*",
-        destination: "https://signal-forge-aapl-lab.alexshmulevich424.chatgpt.site/:path*",
-        permanent: false,
-      },
-    ];
+    const backend = process.env.SIGNAL_FORGE_BACKEND_URL ??
+      "https://signal-forge-aapl-lab.alexshmulevich424.chatgpt.site";
+    return {
+      beforeFiles: [
+        {
+          source: "/api/:path*",
+          destination: `${backend}/api/:path*`,
+        },
+      ],
+      afterFiles: [],
+      fallback: [],
+    };
   },
   typescript: {
     tsconfigPath: process.env.VERCEL ? "tsconfig.vercel.json" : "tsconfig.json",

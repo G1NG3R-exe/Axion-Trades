@@ -8,13 +8,17 @@ import {
   BookOpenCheck,
   BrainCircuit,
   BriefcaseBusiness,
+  Bell,
   CalendarRange,
   Check,
+  ChevronDown,
   Cloud,
   CloudOff,
   Clock3,
   Cpu,
+  CreditCard,
   Database,
+  DollarSign,
   FlaskConical,
   Gauge,
   GraduationCap,
@@ -30,7 +34,10 @@ import {
   RefreshCw,
   RotateCcw,
   Save,
+  Settings,
   ShieldCheck,
+  SlidersHorizontal,
+  Sparkles,
   Sun,
   Target,
   Trophy,
@@ -108,9 +115,23 @@ type ModelWeights = {
 type Position = "LONG" | "SHORT" | "FLAT";
 type TradeSide = "BUY" | "SELL" | "SHORT" | "COVER";
 type WorkspaceMode = "sandbox" | "live" | null;
+type ActiveView = "chart" | "train" | "paper" | "guide" | "settings" | "account";
+type LaunchView = "chart" | "train" | "paper";
 type MarketRegime = "TREND" | "SQUEEZE" | "RANGE";
 type StrategyAlgorithm = "Trend following" | "Momentum" | "Mean reversion" | "Volume breakout";
 type AccountUser = { id: string; username: string };
+type AvatarPreset = "mint" | "ocean" | "violet" | "sunset" | "graphite" | "rose";
+
+type UserProfile = {
+  displayName: string;
+  avatarPreset: AvatarPreset;
+};
+
+type LabPreferences = {
+  paperStartingCash: number;
+  launchView: LaunchView;
+  animations: boolean;
+};
 
 type PendingEntry = {
   side: "LONG" | "SHORT";
@@ -219,13 +240,15 @@ type TrainingRun = {
 };
 
 type PersistedLabState = {
-  version: 6;
+  version: 7;
   theme: "light" | "dark";
   model: ModelWeights;
   trainingEpoch: number;
   trainingRuns: TrainingRun[];
   paper: PaperAccount;
   range: { start: string; end: string };
+  profile: UserProfile;
+  preferences: LabPreferences;
 };
 
 const STARTING_CAPITAL = 10_000;
@@ -237,7 +260,8 @@ const DATA_END = "2026-07-29";
 const BACKTEST_MIN = "2024-01-02";
 const DEFAULT_START = "2024-01-02";
 const DEFAULT_END = "2025-12-31";
-const STATE_VERSION = 6;
+const STATE_VERSION = 7;
+const MODEL_STATE_VERSION = 6;
 const BAR_MINUTES = 5;
 const BARS_PER_SESSION = 78;
 const OPENING_RANGE_BARS = 3;
@@ -267,8 +291,20 @@ const INITIAL_MODEL: ModelWeights = {
   threshold: 0.20138767231814566,
 };
 
-const INITIAL_PAPER: PaperAccount = {
-  cash: PAPER_STARTING_CASH,
+const INITIAL_PROFILE: UserProfile = {
+  displayName: "",
+  avatarPreset: "mint",
+};
+
+const INITIAL_PREFERENCES: LabPreferences = {
+  paperStartingCash: PAPER_STARTING_CASH,
+  launchView: "chart",
+  animations: true,
+};
+
+function createInitialPaper(startingCash = PAPER_STARTING_CASH): PaperAccount {
+  return {
+  cash: startingCash,
   shares: 0,
   avgPrice: 0,
   positionOpenedAt: 0,
@@ -284,13 +320,16 @@ const INITIAL_PAPER: PaperAccount = {
   currentSession: "",
   entriesThisSession: 0,
   cooldownBars: 0,
-  dailyStartEquity: PAPER_STARTING_CASH,
+  dailyStartEquity: startingCash,
   dailyLocked: false,
   lastBarTimestamp: "",
   realized: 0,
   orders: [],
   equityHistory: [],
-};
+  };
+}
+
+const INITIAL_PAPER = createInitialPaper();
 
 const clamp = (value: number, min: number, max: number) =>
   Math.min(max, Math.max(min, value));
@@ -311,6 +350,12 @@ const compact = (value: number) =>
     notation: "compact",
     maximumFractionDigits: 1,
   }).format(value);
+
+function initialsFromName(value: string) {
+  const parts = value.trim().split(/\s+/).filter(Boolean);
+  if (parts.length > 1) return `${parts[0][0]}${parts[parts.length - 1][0]}`.toUpperCase();
+  return (parts[0] || "SF").slice(0, 2).toUpperCase();
+}
 
 type FillKind = "market" | "stop" | "limit";
 
@@ -2184,7 +2229,7 @@ function EquityChart({ result, theme }: { result: BacktestResult; theme: "light"
   );
 }
 
-function PortfolioChart({ history, theme }: { history: PaperAccount["equityHistory"]; theme: "light" | "dark" }) {
+function PortfolioChart({ history, theme, baseline }: { history: PaperAccount["equityHistory"]; theme: "light" | "dark"; baseline: number }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const [revision, setRevision] = useState(0);
@@ -2211,7 +2256,7 @@ function PortfolioChart({ history, theme }: { history: PaperAccount["equityHisto
     if (!context) return;
     context.setTransform(ratio, 0, 0, ratio, 0, 0);
     context.clearRect(0, 0, width, height);
-    const values = history.length > 1 ? history.map((point) => point.value) : [PAPER_STARTING_CASH, PAPER_STARTING_CASH];
+    const values = history.length > 1 ? history.map((point) => point.value) : [baseline, baseline];
     const min = Math.min(...values) * 0.998;
     const max = Math.max(...values) * 1.002;
     const spread = Math.max(1, max - min);
@@ -2230,7 +2275,7 @@ function PortfolioChart({ history, theme }: { history: PaperAccount["equityHisto
     gradient.addColorStop(1, "rgba(98,214,182,0)");
     context.fillStyle = gradient;
     context.fill();
-  }, [history, revision, theme]);
+  }, [baseline, history, revision, theme]);
 
   return (
     <div className="portfolio-canvas" ref={wrapRef}>
@@ -2332,7 +2377,7 @@ function normalizeModel(value: unknown): ModelWeights {
 
 function migrateModel(value: unknown, version: number): ModelWeights {
   const saved = normalizeModel(value);
-  if (version >= STATE_VERSION) return saved;
+  if (version >= MODEL_STATE_VERSION) return saved;
   const keep = 0.35;
   return normalizeModel({
     trend: saved.trend * keep + INITIAL_MODEL.trend * (1 - keep),
@@ -2350,13 +2395,40 @@ function migrateModel(value: unknown, version: number): ModelWeights {
   });
 }
 
-function normalizePaper(value: unknown): PaperAccount {
+function normalizeProfile(value: unknown): UserProfile {
+  const profile = (value ?? {}) as Partial<UserProfile>;
+  const avatarPresets: AvatarPreset[] = ["mint", "ocean", "violet", "sunset", "graphite", "rose"];
+  return {
+    displayName: typeof profile.displayName === "string" ? profile.displayName.trim().slice(0, 32) : "",
+    avatarPreset: avatarPresets.includes(profile.avatarPreset as AvatarPreset)
+      ? profile.avatarPreset as AvatarPreset
+      : INITIAL_PROFILE.avatarPreset,
+  };
+}
+
+function normalizePreferences(value: unknown): LabPreferences {
+  const preferences = (value ?? {}) as Partial<LabPreferences>;
+  const launchView: LaunchView = preferences.launchView === "train" || preferences.launchView === "paper"
+    ? preferences.launchView
+    : "chart";
+  return {
+    paperStartingCash: clamp(
+      Math.round(finiteNumber(preferences.paperStartingCash, PAPER_STARTING_CASH)),
+      100,
+      1_000_000,
+    ),
+    launchView,
+    animations: preferences.animations !== false,
+  };
+}
+
+function normalizePaper(value: unknown, startingCash = PAPER_STARTING_CASH): PaperAccount {
   const paper = (value ?? {}) as Partial<PaperAccount>;
   const pending = paper.pendingEntry && typeof paper.pendingEntry === "object"
     ? paper.pendingEntry as PendingEntry
     : null;
   return {
-    cash: finiteNumber(paper.cash, PAPER_STARTING_CASH),
+    cash: finiteNumber(paper.cash, startingCash),
     shares: Math.trunc(finiteNumber(paper.shares, 0)),
     avgPrice: Math.max(0, finiteNumber(paper.avgPrice, 0)),
     positionOpenedAt: Math.max(0, finiteNumber(paper.positionOpenedAt, 0)),
@@ -2394,7 +2466,7 @@ function normalizePaper(value: unknown): PaperAccount {
     currentSession: typeof paper.currentSession === "string" ? paper.currentSession : "",
     entriesThisSession: Math.max(0, Math.trunc(finiteNumber(paper.entriesThisSession, 0))),
     cooldownBars: Math.max(0, Math.trunc(finiteNumber(paper.cooldownBars, 0))),
-    dailyStartEquity: Math.max(0, finiteNumber(paper.dailyStartEquity, PAPER_STARTING_CASH)),
+    dailyStartEquity: Math.max(0, finiteNumber(paper.dailyStartEquity, startingCash)),
     dailyLocked: Boolean(paper.dailyLocked),
     lastBarTimestamp: typeof paper.lastBarTimestamp === "string" ? paper.lastBarTimestamp : "",
     realized: finiteNumber(paper.realized, 0),
@@ -2414,13 +2486,14 @@ function normalizePersistedState(value: unknown): PersistedLabState | null {
   const state = value as Partial<PersistedLabState>;
   const range = state.range;
   const savedVersion = Math.trunc(finiteNumber(state.version, 1));
+  const preferences = normalizePreferences(state.preferences);
   return {
     version: STATE_VERSION,
     theme: state.theme === "light" || state.theme === "dark" ? state.theme : "light",
     model: migrateModel(state.model, savedVersion),
     trainingEpoch: Math.max(0, Math.trunc(finiteNumber(state.trainingEpoch, 1840))),
     trainingRuns: Array.isArray(state.trainingRuns) ? state.trainingRuns.slice(0, 40) : [],
-    paper: normalizePaper(state.paper),
+    paper: normalizePaper(state.paper, preferences.paperStartingCash),
     range: range &&
       typeof range.start === "string" &&
       typeof range.end === "string" &&
@@ -2429,6 +2502,8 @@ function normalizePersistedState(value: unknown): PersistedLabState | null {
       range.start < range.end
       ? range
       : { start: DEFAULT_START, end: DEFAULT_END },
+    profile: normalizeProfile(state.profile),
+    preferences,
   };
 }
 
@@ -2437,7 +2512,7 @@ export default function Home() {
   const [draftEnd, setDraftEnd] = useState(DEFAULT_END);
   const [range, setRange] = useState({ start: DEFAULT_START, end: DEFAULT_END });
   const [viewport, setViewport] = useState<"ALL" | "1M" | "2W" | "5D">("2W");
-  const [activeView, setActiveView] = useState<"chart" | "train" | "paper" | "guide">("chart");
+  const [activeView, setActiveView] = useState<ActiveView>("chart");
   const [backtestTab, setBacktestTab] = useState<"chart" | "performance" | "trades">("chart");
   const [trainingTab, setTrainingTab] = useState<"run" | "checkpoints" | "policy">("run");
   const [portfolioTab, setPortfolioTab] = useState<"account" | "orders" | "automation">("account");
@@ -2466,8 +2541,15 @@ export default function Home() {
   const [paperPrice, setPaperPrice] = useState(PAPER_STREAM[0]?.open ?? MARKET_DATA[MARKET_DATA.length - 1].close);
   const [paperBarIndex, setPaperBarIndex] = useState(0);
   const [paper, setPaper] = useState<PaperAccount>({ ...INITIAL_PAPER });
+  const [profile, setProfile] = useState<UserProfile>({ ...INITIAL_PROFILE });
+  const [preferences, setPreferences] = useState<LabPreferences>({ ...INITIAL_PREFERENCES });
+  const [profileNameDraft, setProfileNameDraft] = useState("");
+  const [avatarDraft, setAvatarDraft] = useState<AvatarPreset>(INITIAL_PROFILE.avatarPreset);
+  const [capitalDraft, setCapitalDraft] = useState(String(PAPER_STARTING_CASH));
+  const [profileMenuOpen, setProfileMenuOpen] = useState(false);
   const [toast, setToast] = useState("");
   const saveTimerRef = useRef<number | null>(null);
+  const profileMenuRef = useRef<HTMLDivElement | null>(null);
 
   const filteredData = useMemo(
     () => MARKET_DATA.filter((bar) => bar.date >= range.start && bar.date <= range.end),
@@ -2486,7 +2568,7 @@ export default function Home() {
   const latestFactors = latestDecision.factors;
   const marketClock = getMarketClock(clock);
   const paperValue = paper.cash + paper.shares * paperPrice;
-  const paperPnl = paperValue - PAPER_STARTING_CASH;
+  const paperPnl = paperValue - preferences.paperStartingCash;
   const paperPosition: Position = paper.shares > 0 ? "LONG" : paper.shares < 0 ? "SHORT" : "FLAT";
   const paperUnrealized =
     paper.shares > 0
@@ -2521,6 +2603,26 @@ export default function Home() {
     if (!themeReady) return;
     document.documentElement.dataset.theme = theme;
   }, [theme, themeReady]);
+
+  useEffect(() => {
+    document.documentElement.dataset.motion = preferences.animations ? "full" : "reduced";
+  }, [preferences.animations]);
+
+  useEffect(() => {
+    if (!profileMenuOpen) return;
+    const closeOnPointerDown = (event: PointerEvent) => {
+      if (!profileMenuRef.current?.contains(event.target as Node)) setProfileMenuOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setProfileMenuOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOnPointerDown);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnPointerDown);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [profileMenuOpen]);
 
   useEffect(() => {
     let cancelled = false;
@@ -2570,6 +2672,12 @@ export default function Home() {
           setTrainingEpoch(saved.trainingEpoch);
           setTrainingRuns(saved.trainingRuns);
           setPaper(saved.paper);
+          setProfile(saved.profile);
+          setProfileNameDraft(saved.profile.displayName || accountUser.username);
+          setAvatarDraft(saved.profile.avatarPreset);
+          setPreferences(saved.preferences);
+          setCapitalDraft(String(saved.preferences.paperStartingCash));
+          setActiveView(saved.preferences.launchView);
           setRange(saved.range);
           setDraftStart(saved.range.start);
           setDraftEnd(saved.range.end);
@@ -2579,6 +2687,14 @@ export default function Home() {
           setPaperPrice(savedBarIndex < 0
             ? (PAPER_STREAM[0]?.open ?? MARKET_DATA[MARKET_DATA.length - 1].close)
             : PAPER_STREAM[savedBarIndex].close);
+        } else if (!cancelled) {
+          const newProfile = { ...INITIAL_PROFILE, displayName: accountUser.username };
+          setProfile(newProfile);
+          setProfileNameDraft(newProfile.displayName);
+          setAvatarDraft(newProfile.avatarPreset);
+          setPreferences({ ...INITIAL_PREFERENCES });
+          setCapitalDraft(String(INITIAL_PREFERENCES.paperStartingCash));
+          setPaper(createInitialPaper(INITIAL_PREFERENCES.paperStartingCash));
         }
         if (!cancelled) {
           setSyncStatus("saved");
@@ -2607,6 +2723,8 @@ export default function Home() {
         trainingRuns: trainingRuns.slice(0, 40),
         paper,
         range,
+        profile,
+        preferences,
       };
       try {
         const response = await fetch("/api/state", {
@@ -2629,7 +2747,7 @@ export default function Home() {
     return () => {
       if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
     };
-  }, [accountStatus, accountUser, hydrated, model, paper, range, theme, trainingEpoch, trainingRuns]);
+  }, [accountStatus, accountUser, hydrated, model, paper, preferences, profile, range, theme, trainingEpoch, trainingRuns]);
 
   useEffect(() => {
     if (!toast) return;
@@ -2671,7 +2789,12 @@ export default function Home() {
       setModel(INITIAL_MODEL);
       setTrainingEpoch(1840);
       setTrainingRuns([]);
-      setPaper({ ...INITIAL_PAPER });
+      setPreferences({ ...INITIAL_PREFERENCES });
+      setCapitalDraft(String(INITIAL_PREFERENCES.paperStartingCash));
+      setProfile({ ...INITIAL_PROFILE, displayName: body.user.username });
+      setProfileNameDraft(body.user.username);
+      setAvatarDraft(INITIAL_PROFILE.avatarPreset);
+      setPaper(createInitialPaper(INITIAL_PREFERENCES.paperStartingCash));
       setRange({ start: DEFAULT_START, end: DEFAULT_END });
       setDraftStart(DEFAULT_START);
       setDraftEnd(DEFAULT_END);
@@ -2703,7 +2826,13 @@ export default function Home() {
       setModel(INITIAL_MODEL);
       setTrainingEpoch(1840);
       setTrainingRuns([]);
-      setPaper({ ...INITIAL_PAPER });
+      setPreferences({ ...INITIAL_PREFERENCES });
+      setProfile({ ...INITIAL_PROFILE });
+      setProfileNameDraft("");
+      setAvatarDraft(INITIAL_PROFILE.avatarPreset);
+      setCapitalDraft(String(INITIAL_PREFERENCES.paperStartingCash));
+      setProfileMenuOpen(false);
+      setPaper(createInitialPaper(INITIAL_PREFERENCES.paperStartingCash));
       setPaperBarIndex(0);
       setPaperPrice(PAPER_STREAM[0]?.open ?? MARKET_DATA[MARKET_DATA.length - 1].close);
     }
@@ -2855,12 +2984,42 @@ export default function Home() {
   }, [model, training, trainingEpoch]);
 
   const resetPaper = () => {
-    setPaper({ ...INITIAL_PAPER, orders: [], equityHistory: [] });
+    setPaper(createInitialPaper(preferences.paperStartingCash));
     setPaperBarIndex(0);
     setPaperPrice(PAPER_STREAM[0]?.open ?? MARKET_DATA[MARKET_DATA.length - 1].close);
     setPaperActive(false);
     setReplayMode(false);
-    setToast("Paper account reset to $25,000");
+    setToast(`Paper account reset to ${money(preferences.paperStartingCash)}`);
+  };
+
+  const applyPaperStartingCash = () => {
+    const parsed = Number(capitalDraft.replace(/[$,\s]/g, ""));
+    if (!Number.isFinite(parsed) || parsed < 100 || parsed > 1_000_000) {
+      setToast("Choose a sandbox balance from $100 to $1,000,000");
+      return;
+    }
+    const nextCapital = Math.round(parsed);
+    setPreferences((current) => ({ ...current, paperStartingCash: nextCapital }));
+    setCapitalDraft(String(nextCapital));
+    setPaper(createInitialPaper(nextCapital));
+    setPaperBarIndex(0);
+    setPaperPrice(PAPER_STREAM[0]?.open ?? MARKET_DATA[MARKET_DATA.length - 1].close);
+    setPaperActive(false);
+    setReplayMode(false);
+    setToast(`Sandbox balance set to ${money(nextCapital)} / portfolio reset`);
+  };
+
+  const saveProfile = () => {
+    const displayName = profileNameDraft.trim().slice(0, 32) || accountUser?.username || "Signal Forge";
+    setProfile({ displayName, avatarPreset: avatarDraft });
+    setProfileNameDraft(displayName);
+    setToast("Profile saved to your account");
+  };
+
+  const openAccountView = (view: "account" | "settings") => {
+    setProfileMenuOpen(false);
+    setWorkspaceMode("sandbox");
+    setActiveView(view);
   };
 
   const factors = [
@@ -2883,7 +3042,49 @@ export default function Home() {
     { label: "Volume breakout", value: latestDecision.algorithms.breakout, detail: "ORB · levels · OBV flow" },
   ];
 
-  const accountInitials = (accountUser?.username ?? "SF").slice(0, 2).toUpperCase();
+  const accountDisplayName = profile.displayName || accountUser?.username || "Signal Forge";
+  const accountInitials = initialsFromName(accountDisplayName);
+  const avatarPresets: Array<{ id: AvatarPreset; label: string }> = [
+    { id: "mint", label: "Mint" },
+    { id: "ocean", label: "Ocean" },
+    { id: "violet", label: "Violet" },
+    { id: "sunset", label: "Sunset" },
+    { id: "graphite", label: "Graphite" },
+    { id: "rose", label: "Rose" },
+  ];
+
+  const renderProfileMenu = () => (
+    <div className={`profile-menu-wrap ${profileMenuOpen ? "open" : ""}`} ref={profileMenuRef}>
+      <button
+        className="profile-trigger"
+        type="button"
+        aria-haspopup="menu"
+        aria-expanded={profileMenuOpen}
+        aria-label={`Open account menu for ${accountDisplayName}`}
+        onClick={() => setProfileMenuOpen((open) => !open)}
+      >
+        <span className="avatar profile-avatar" data-avatar={profile.avatarPreset}>{accountInitials}</span>
+        <ChevronDown size={13} aria-hidden="true" />
+      </button>
+      {profileMenuOpen && (
+        <div className="profile-menu" role="menu" aria-label="Account menu">
+          <div className="profile-menu-identity">
+            <span className="avatar profile-menu-avatar" data-avatar={profile.avatarPreset}>{accountInitials}</span>
+            <div><strong>{accountDisplayName}</strong><small>@{accountUser?.username}</small></div>
+            <span className={`menu-sync-dot ${syncStatus}`} title={syncStatus} />
+          </div>
+          <div className="profile-menu-group">
+            <button role="menuitem" type="button" onClick={() => openAccountView("account")}><UserRound size={15} /><span><strong>Account</strong><small>Profile and connections</small></span></button>
+            <button role="menuitem" type="button" onClick={() => openAccountView("settings")}><Settings size={15} /><span><strong>Settings</strong><small>Balance and preferences</small></span></button>
+          </div>
+          <div className="profile-menu-group secondary">
+            <button role="menuitem" type="button" onClick={() => { setProfileMenuOpen(false); setWorkspaceMode(null); }}><FlaskConical size={15} /><span><strong>Switch environment</strong><small>Sandbox or empty Live</small></span></button>
+            <button className="menu-signout" role="menuitem" type="button" onClick={() => void signOut()}><LogOut size={15} /><span><strong>Sign out</strong><small>End this protected session</small></span></button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
 
   if (accountStatus === "loading") {
     return (
@@ -2959,8 +3160,7 @@ export default function Home() {
           <a className="brand" href="#mode" aria-label="Signal Forge mode selection"><span className="brand-mark" aria-hidden="true" /><span>Signal <b>Forge</b></span><em>LAB</em></a>
           <div className="gateway-account-actions">
             <button className="theme-toggle" type="button" onClick={() => setTheme((current) => current === "dark" ? "light" : "dark")} aria-label="Toggle color theme">{theme === "dark" ? <Sun size={16} /> : <Moon size={16} />}</button>
-            <span className="gateway-user"><i>{accountInitials}</i>{accountUser?.username}</span>
-            <button className="icon-text-button" type="button" onClick={() => void signOut()}><LogOut size={14} /> Sign out</button>
+            {renderProfileMenu()}
           </div>
         </header>
         <section className="mode-gateway" id="mode">
@@ -2988,7 +3188,7 @@ export default function Home() {
           <div className="top-actions">
             <button className="theme-toggle" type="button" onClick={() => setTheme((current) => current === "dark" ? "light" : "dark")} aria-label="Toggle color theme">{theme === "dark" ? <Sun size={16} /> : <Moon size={16} />}</button>
             <button className="icon-text-button" type="button" onClick={() => setWorkspaceMode(null)}>Switch mode</button>
-            <button className="avatar avatar-button" type="button" onClick={() => void signOut()} title={`Sign out ${accountUser?.username}`}>{accountInitials}</button>
+            {renderProfileMenu()}
           </div>
         </header>
         <section className="live-empty" id="live">
@@ -3053,7 +3253,7 @@ export default function Home() {
             <BriefcaseBusiness size={15} />
             {money(paperValue)}
           </button>
-          <button className="avatar avatar-button" type="button" aria-label={`Account ${accountUser?.username}; click to change mode`} title={`${accountUser?.username} / change mode`} onClick={() => setWorkspaceMode(null)}>{accountInitials}</button>
+          {renderProfileMenu()}
         </div>
       </header>
 
@@ -3460,7 +3660,7 @@ export default function Home() {
                 {portfolioTab === "account" && <>
                 <div className="paper-account-top">
                   <div><span>Net liquidation value</span><strong>{money(paperValue, 2)}</strong><small className={`position-pill ${paperPosition.toLowerCase()}`}>{paperPosition}</small></div>
-                  <div className={paperPnl >= 0 ? "paper-pnl positive" : "paper-pnl negative"}><span>Total result</span><strong>{percent(paperPnl / PAPER_STARTING_CASH, 2)}</strong><small>{money(paperPnl, 2)}</small></div>
+                  <div className={paperPnl >= 0 ? "paper-pnl positive" : "paper-pnl negative"}><span>Total result</span><strong>{percent(paperPnl / preferences.paperStartingCash, 2)}</strong><small>{money(paperPnl, 2)}</small></div>
                 </div>
 
                 <div className="paper-stats refined-paper-stats">
@@ -3472,7 +3672,7 @@ export default function Home() {
 
                 <div className="portfolio-performance">
                   <div><span>Portfolio history</span><small>{paper.equityHistory.length ? `${paper.equityHistory.length} saved marks` : "Starts when the bot runs"}</small></div>
-                  <PortfolioChart history={paper.equityHistory} theme={theme} />
+                  <PortfolioChart history={paper.equityHistory} theme={theme} baseline={preferences.paperStartingCash} />
                 </div>
                 </>}
 
@@ -3493,7 +3693,7 @@ export default function Home() {
                   {!marketClock.isOpen && (
                     <button className={replayMode ? "secondary-button active" : "secondary-button"} type="button" onClick={() => {
                       if (!replayMode && paperBarIndex >= PAPER_STREAM.length) {
-                        setPaper({ ...INITIAL_PAPER });
+                        setPaper(createInitialPaper(preferences.paperStartingCash));
                         setPaperBarIndex(0);
                         setPaperPrice(PAPER_STREAM[0]?.open ?? paperPrice);
                       }
@@ -3541,6 +3741,165 @@ export default function Home() {
                 </div>
                 <div className="paper-disclosure"><Database size={14} /> Portfolio and order history are saved. Prices and fills remain simulated.</div>
               </aside>}
+            </div>
+          </section>
+        )}
+
+        {activeView === "settings" && (
+          <section className="panel focused-workspace settings-workspace" id="settings">
+            <div className="workspace-heading settings-heading">
+              <div>
+                <span className="view-kicker">WORKSPACE SETTINGS</span>
+                <h2>Make the sandbox yours</h2>
+                <p>Control the fake-money account, launch behavior, appearance, and motion without changing the trading policy.</p>
+              </div>
+              <span className="settings-saved"><Save size={13} /> {syncStatus === "saved" ? "Saved to account" : syncStatus === "saving" ? "Saving changes" : "Changes sync automatically"}</span>
+            </div>
+
+            <div className="settings-grid">
+              <article className="settings-card capital-settings-card">
+                <div className="settings-card-heading">
+                  <span className="settings-card-icon mint"><DollarSign size={18} /></span>
+                  <div><small>SANDBOX WALLET</small><h3>Starting balance</h3><p>Choose how much fake cash every fresh paper session begins with.</p></div>
+                </div>
+
+                <div className="capital-preview">
+                  <span>Next reset</span>
+                  <strong>{money(Number(capitalDraft.replace(/[$,\s]/g, "")) || preferences.paperStartingCash)}</strong>
+                  <small>Current portfolio value {money(paperValue, 2)}</small>
+                </div>
+
+                <div className="capital-presets" aria-label="Starting balance presets">
+                  {[1_000, 5_000, 10_000, 25_000, 100_000].map((amount) => (
+                    <button className={Number(capitalDraft) === amount ? "active" : ""} type="button" key={amount} onClick={() => setCapitalDraft(String(amount))}>{money(amount)}</button>
+                  ))}
+                </div>
+
+                <label className="settings-field" htmlFor="paper-capital">
+                  <span>Custom amount</span>
+                  <div><DollarSign size={15} /><input id="paper-capital" type="number" inputMode="numeric" min={100} max={1_000_000} step={100} value={capitalDraft} onChange={(event) => setCapitalDraft(event.target.value)} /></div>
+                  <small>$100 minimum / $1,000,000 maximum</small>
+                </label>
+
+                <div className="capital-impact">
+                  <div><span>Risk ceiling per trade</span><strong>{money(preferences.paperStartingCash * RISK_PER_TRADE_FRACTION, 2)}</strong><small>0.5% of starting balance</small></div>
+                  <div><span>Daily loss lock</span><strong>{money(preferences.paperStartingCash * DAILY_LOSS_LIMIT_FRACTION, 2)}</strong><small>2% from session start</small></div>
+                </div>
+
+                <div className="settings-warning"><Info size={14} /><span>Applying a new balance clears the current fake positions, orders, and portfolio chart. It does not reset training.</span></div>
+                <button className="primary-button settings-apply" type="button" onClick={applyPaperStartingCash}><RefreshCw size={15} /> Apply balance &amp; reset portfolio</button>
+              </article>
+
+              <div className="settings-stack">
+                <article className="settings-card">
+                  <div className="settings-card-heading compact-heading">
+                    <span className="settings-card-icon violet"><Sparkles size={17} /></span>
+                    <div><small>INTERFACE</small><h3>Appearance</h3></div>
+                  </div>
+                  <div className="setting-row">
+                    <div><strong>Color mode</strong><small>Light is the default for new accounts.</small></div>
+                    <div className="setting-segmented" aria-label="Color mode">
+                      <button className={theme === "light" ? "active" : ""} type="button" onClick={() => setTheme("light")}><Sun size={14} /> Light</button>
+                      <button className={theme === "dark" ? "active" : ""} type="button" onClick={() => setTheme("dark")}><Moon size={14} /> Dark</button>
+                    </div>
+                  </div>
+                  <div className="setting-row">
+                    <div><strong>Interface motion</strong><small>Turns decorative movement and transitions on or off.</small></div>
+                    <button className={`switch-control ${preferences.animations ? "on" : ""}`} type="button" role="switch" aria-checked={preferences.animations} onClick={() => setPreferences((current) => ({ ...current, animations: !current.animations }))}><span /></button>
+                  </div>
+                </article>
+
+                <article className="settings-card">
+                  <div className="settings-card-heading compact-heading">
+                    <span className="settings-card-icon blue"><SlidersHorizontal size={17} /></span>
+                    <div><small>WORKFLOW</small><h3>Startup workspace</h3></div>
+                  </div>
+                  <p className="setting-intro">The page you see first after your saved account data loads.</p>
+                  <div className="launch-options">
+                    {([
+                      ["chart", "Backtest", "Replay unseen dates"],
+                      ["train", "Training", "Open the learning lab"],
+                      ["paper", "Portfolio", "Open paper trading"],
+                    ] as Array<[LaunchView, string, string]>).map(([view, label, detail]) => (
+                      <button className={preferences.launchView === view ? "active" : ""} type="button" key={view} onClick={() => setPreferences((current) => ({ ...current, launchView: view }))}><span><strong>{label}</strong><small>{detail}</small></span>{preferences.launchView === view && <Check size={14} />}</button>
+                    ))}
+                  </div>
+                </article>
+
+                <article className="settings-card muted-setting-card">
+                  <div className="settings-card-heading compact-heading">
+                    <span className="settings-card-icon graphite"><Bell size={17} /></span>
+                    <div><small>NOTIFICATIONS</small><h3>Market-open reminders</h3></div>
+                  </div>
+                  <p>Browser reminders will arrive after a real quote service exists. Nothing can be enabled in this sandbox build.</p>
+                  <button className="secondary-button" type="button" disabled>Coming later</button>
+                </article>
+              </div>
+            </div>
+          </section>
+        )}
+
+        {activeView === "account" && (
+          <section className="panel focused-workspace account-workspace" id="account-profile">
+            <div className="workspace-heading account-heading">
+              <div>
+                <span className="view-kicker">YOUR ACCOUNT</span>
+                <h2>Identity, access, and connections</h2>
+                <p>Personalize the profile attached to this private lab. Trading data stays isolated under your sign-in.</p>
+              </div>
+              <span className="account-plan"><Sparkles size={13} /> Research sandbox</span>
+            </div>
+
+            <div className="account-grid">
+              <article className="account-profile-card">
+                <div className="profile-hero">
+                  <span className="avatar account-hero-avatar" data-avatar={avatarDraft}>{initialsFromName(profileNameDraft || accountDisplayName)}</span>
+                  <div><small>PROFILE PREVIEW</small><h3>{profileNameDraft || accountDisplayName}</h3><p>@{accountUser?.username} / Signal Forge member</p></div>
+                </div>
+
+                <div className="account-form-grid">
+                  <label className="account-field" htmlFor="profile-display-name"><span>Display name</span><input id="profile-display-name" maxLength={32} value={profileNameDraft} onChange={(event) => setProfileNameDraft(event.target.value)} placeholder={accountUser?.username} /><small>Shown in the account menu; your sign-in ID does not change.</small></label>
+                  <label className="account-field locked-field" htmlFor="profile-username"><span>Username</span><div><LockKeyhole size={14} /><input id="profile-username" value={accountUser?.username ?? ""} readOnly /></div><small>Username changes are locked in this prototype.</small></label>
+                </div>
+
+                <div className="avatar-picker-heading"><div><strong>Profile photo style</strong><small>Pick a private, account-synced avatar.</small></div><span>{avatarPresets.find((item) => item.id === avatarDraft)?.label}</span></div>
+                <div className="avatar-picker" aria-label="Profile photo styles">
+                  {avatarPresets.map((preset) => (
+                    <button className={avatarDraft === preset.id ? "active" : ""} type="button" key={preset.id} onClick={() => setAvatarDraft(preset.id)} aria-label={`Use ${preset.label} profile style`}>
+                      <span className="avatar" data-avatar={preset.id}>{initialsFromName(profileNameDraft || accountDisplayName)}</span>
+                      {avatarDraft === preset.id && <Check size={12} />}
+                    </button>
+                  ))}
+                </div>
+
+                <button className="primary-button profile-save-button" type="button" onClick={saveProfile}><Save size={15} /> Save profile</button>
+              </article>
+
+              <div className="account-side-stack">
+                <article className="account-detail-card connection-card">
+                  <div className="account-card-top"><span className="settings-card-icon blue"><CreditCard size={17} /></span><span className="coming-pill">NOT CONNECTED</span></div>
+                  <h3>Payments &amp; brokerage</h3>
+                  <p>There is no payment processor, brokerage link, or real-money route in this build.</p>
+                  <div className="connection-placeholder"><CreditCard size={18} /><span><strong>Connect payment method</strong><small>Disabled until billing is built</small></span><LockKeyhole size={14} /></div>
+                  <button className="secondary-button disabled-connection" type="button" disabled><CreditCard size={14} /> Connect payment</button>
+                </article>
+
+                <article className="account-detail-card">
+                  <div className="account-card-top"><span className="settings-card-icon mint"><ShieldCheck size={17} /></span><span className="healthy-pill">PROTECTED</span></div>
+                  <h3>Account security</h3>
+                  <div className="account-detail-list">
+                    <div><span>Session</span><strong>HTTP-only cookie</strong></div>
+                    <div><span>Password</span><strong>Salted slow hash</strong></div>
+                    <div><span>Account ID</span><strong>{accountUser?.id.slice(0, 8)}...</strong></div>
+                  </div>
+                  <button className="secondary-button" type="button" disabled>Change password / coming soon</button>
+                </article>
+
+                <article className="account-detail-card account-data-card">
+                  <div><Database size={17} /><span><strong>Your lab travels with you</strong><small>Profile, settings, model, dates, checkpoints, paper portfolio, and orders are saved under @{accountUser?.username}.</small></span></div>
+                  <button className="text-button" type="button" onClick={() => openAccountView("settings")}>Open settings <ArrowUpRight size={14} /></button>
+                </article>
+              </div>
             </div>
           </section>
         )}
