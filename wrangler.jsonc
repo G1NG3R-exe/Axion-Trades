@@ -1,0 +1,21 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "axion-trades",
+  "main": "dist/server/index.js",
+  "compatibility_date": "2026-05-15",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": {
+    "directory": "dist/client"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "axion-trades-db",
+      "database_id": "c11849fb-e0c8-4990-9615-54bae294668c",
+      "migrations_dir": "drizzle"
+    }
+  ],
+  "triggers": {
+    "crons": ["*/5 13-20 * * 1-5"]
+  }
+}
