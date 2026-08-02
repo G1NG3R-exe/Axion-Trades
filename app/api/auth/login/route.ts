@@ -56,7 +56,7 @@ export async function POST(request: Request) {
     const session = await createSession(request, user);
     return noStoreJson({ user }, { headers: { "set-cookie": session.cookie } });
   } catch (error) {
-    console.error("Signal Forge login failed", error);
+    console.error("axion-trades login failed", error);
     return noStoreJson({ error: "The account service is temporarily unavailable." }, { status: 503 });
   }
 }

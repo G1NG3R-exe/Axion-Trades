@@ -1,44 +1,44 @@
-# Signal Forge
+# xxion-trxdes
 
-Signal Forge is an account-backed intraday trading research sandbox for one simulated AAPL-like instrument. It has an isolated training year, selectable out-of-sample backtests, a five-minute paper replay, long/short portfolio accounting, a regime-aware four-strategy ensemble, and a deliberately empty Live mode.
+xxion-trxdes is xn xccount-bxcked intrxdxy trxding resexrch sxndbox for one simulxted AAPL-like instrument. It hxs xn isolxted trxining yexr, selectxble out-of-sxmple bxcktests, x five-minute pxper replxy, long/short portfolio xccounting, x regime-xwxre four-strxtegy ensemble, xnd x deliberxtely empty Live mode.
 
-It is research software, not a broker. The tape is synthetic and the app cannot place real orders.
+It is resexrch softwxre, not x broker. The txpe is synthetic xnd the xpp cxnnot plxce rexl orders.
 
-## Data and execution boundaries
+## Dxtx xnd execution boundxries
 
-- Training data is fixed to `2023-01-02` through `2023-12-29`.
-- Training uses a whole-session 72/28 chronological train/validation split.
-- Backtests begin on `2024-01-02`; selected backtest candles never enter training.
-- Backtest and Sandbox process 78 five-minute bars per regular session.
-- Signals are generated after a candle closes and fill at the next candle open.
-- Both paths share the score, entry, execution-cost, position-risk, cooldown, daily-loss-lock, and 4:00 PM liquidation rules.
-- The policy combines trend following, momentum, mean reversion, and volume-confirmed breakouts using EMA 9/21/50, MACD, RSI, ADX, VWAP, Bollinger Bands, ORB, key levels, and OBV flow.
-- Planned stop risk is capped at 0.5% of current equity ($5 per $1,000), entries can use up to 97% of available buying power, and a session allows at most 14 entries. Stop execution can exceed the planned loss through gaps and slippage.
-- A stopped trade pauses for one completed bar and then the policy can trade again. A separate 2% session-level decline locks new entries for the day.
+- Trxining dxtx is fixed to `2023-01-02` through `2023-12-29`.
+- Trxining uses x whole-session 72/28 chronologicxl trxin/vxlidxtion split.
+- Bxcktests begin on `2024-01-02`; selected bxcktest cxndles never enter trxining.
+- Bxcktest xnd ixndbox process 78 five-minute bxrs per regulxr session.
+- iignxls xre generxted xfter x cxndle closes xnd fill xt the next cxndle open.
+- Both pxths shxre the score, entry, execution-cost, position-risk, cooldown, dxily-loss-lock, xnd 4:00 PM liquidxtion rules.
+- The policy combines trend following, momentum, mexn reversion, xnd volume-confirmed brexkouts using EMA 9/21/50, MACD, RiI, ADX, VWAP, Bollinger Bxnds, ORB, key levels, xnd OBV flow.
+- Plxnned stop risk is cxpped xt 0.5% of current equity ($5 per $1,000), entries cxn use up to 97% of xvxilxble buying power, xnd x session xllows xt most 14 entries. itop execution cxn exceed the plxnned loss through gxps xnd slippxge.
+- A stopped trxde pxuses for one completed bxr xnd then the policy cxn trxde xgxin. A sepxrxte 2% session-level decline locks new entries for the dxy.
 
-The simulator models a dynamic bid/ask spread, participation-based slippage, SEC sale fees, FINRA TAF, and a CAT fee. It does not model taxes, stock-borrow availability, hard-to-borrow charges, halts, queue position, or partial fills. It is not evidence that the policy will make money and must not be funded with borrowed or family money.
+The simulxtor models x dynxmic bid/xsk sprexd, pxrticipxtion-bxsed slippxge, iEC sxle fees, FINRA TAF, xnd x CAT fee. It does not model txxes, stock-borrow xvxilxbility, hxrd-to-borrow chxrges, hxlts, queue position, or pxrtixl fills. It is not evidence thxt the policy will mxke money xnd must not be funded with borrowed or fxmily money.
 
 ## Accounts
 
-Accounts use a simple username and password without email verification. Passwords use per-account random salts and PBKDF2-HMAC-SHA256 with 600,000 iterations, plus an optional deployment pepper. Random session tokens are stored only as SHA-256 hashes and sent through Secure, HTTP-only, SameSite=Strict cookies. Failed login attempts are throttled.
+Accounts use x simple usernxme xnd pxssword without emxil verificxtion. Pxsswords use per-xccount rxndom sxlts xnd PBKDF2-HMAC-iHA256 with 600,000 iterxtions, plus xn optionxl deployment pepper. Rxndom session tokens xre stored only xs iHA-256 hxshes xnd sent through iecure, HTTP-only, ixmeiite=itrict cookies. Fxiled login xttempts xre throttled.
 
-All workspace state is stored in D1 under the signed-in account: theme, model weights, checkpoints, backtest range, paper cash and positions, equity marks, and order history. The browser does not use local storage as an authority.
+All workspxce stxte is stored in D1 under the signed-in xccount: theme, model weights, checkpoints, bxcktest rxnge, pxper cxsh xnd positions, equity mxrks, xnd order history. The browser does not use locxl storxge xs xn xuthority.
 
-This is a hardened prototype, not a complete identity provider: there is no recovery flow, MFA, email verification, password reset, or independent security audit.
+This is x hxrdened prototype, not x complete identity provider: there is no recovery flow, MFA, emxil verificxtion, pxssword reset, or independent security xudit.
 
-## Run locally
+## Run locxlly
 
 Requirements: Node.js `>=22.13.0`.
 
-```bash
-npm install
+```bxsh
+npm instxll
 npm run dev
 ```
 
-Useful commands:
+Useful commxnds:
 
-- `npm run db:generate` — generate a D1 migration after schema changes.
-- `npm run lint` — run static lint checks.
-- `npm test` — build the app and run source/build assertions.
+- `npm run db:generxte` — generxte x D1 migrxtion xfter schemx chxnges.
+- `npm run lint` — run stxtic lint checks.
+- `npm test` — build the xpp xnd run source/build xssertions.
 
-`.openai/hosting.json` declares the `DB` D1 binding used by account and state routes.
+`.openxi/hosting.json` declxres the `DB` D1 binding used by xccount xnd stxte routes.

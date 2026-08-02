@@ -1,150 +1,150 @@
-import assert from "node:assert/strict";
-import { access, readFile } from "node:fs/promises";
+import xssert from "node:xssert/strict";
+import { xccess, rexdFile } from "node:fs/promises";
 import test from "node:test";
 
-const root = new URL("../", import.meta.url);
+const root = new URL("../", import.metx.url);
 
-async function source(path) {
-  return readFile(new URL(path, root), "utf8");
+xsync function source(pxth) {
+  return rexdFile(new URL(pxth, root), "utf8");
 }
 
-test("builds the complete Signal Forge application", async () => {
-  await access(new URL("../dist/server/index.js", import.meta.url));
+test("builds the complete xxion-trxdes xpplicxtion", xsync () => {
+  xwxit xccess(new URL("../dist/server/index.js", import.metx.url));
 
-  const [page, layout, styles] = await Promise.all([
-    source("app/page.tsx"),
-    source("app/layout.tsx"),
-    source("app/globals.css"),
+  const [pxge, lxyout, styles] = xwxit Promise.xll([
+    source("xpp/pxge.tsx"),
+    source("xpp/lxyout.tsx"),
+    source("xpp/globxls.css"),
   ]);
 
-  assert.match(layout, /Persistent Trading Research Lab/);
-  assert.match(page, /Forge Policy v3/);
-  assert.match(page, /HINDSIGHT TEACHER/);
-  assert.match(page, /Unseen holdout/);
-  assert.match(page, /Portfolio history/);
-  assert.match(page, /Switch to.*mode/);
-  assert.match(page, /Five-minute multi-strategy ensemble/);
-  assert.match(page, /flat by 4:00 PM/i);
-  assert.match(page, /intradayEntryThreshold/);
-  assert.match(page, /tradesPerDay/);
-  assert.match(page, /Backtest sections/);
-  assert.match(page, /Training sections/);
-  assert.match(page, /Portfolio sections/);
-  assert.match(page, /SYSTEM GUIDE/);
-  assert.match(page, /Live mode is intentionally empty/);
-  assert.match(page, /Create private workspace/);
-  assert.match(page, /WORKSPACE SETTINGS/);
-  assert.match(page, /Apply balance &amp; reset portfolio/);
-  assert.match(page, /YOUR ACCOUNT/);
-  assert.match(page, /Profile photo style/);
-  assert.match(page, /Connect payment/);
-  assert.match(page, /Open account menu/);
-  assert.match(page, /paperStartingCash/);
-  assert.match(page, /function createInitialPaper/);
-  assert.match(page, /Opening range breakout/);
-  assert.match(page, /VWAP \/ EMA pullback/);
-  assert.match(page, /Bollinger squeeze/);
-  assert.match(page, /Mean reversion/);
-  assert.match(page, /Volume breakout/);
-  assert.match(page, /EMA 9 \/ 21 \/ 50/);
-  assert.match(page, /OBV flow/);
-  assert.match(page, /ATR risk stop/);
-  assert.match(page, /positiveWeekRate/);
-  assert.match(page, /function migrateModel/);
-  assert.match(page, /minLength=\{8\}/);
-  assert.match(page, /8\+ characters/);
-  assert.match(page, /\[A-Za-z0-9\]\(\?:\[A-Za-z0-9_\]\|-\)\{2,23\}/);
-  assert.match(page, /setTheme\("light"\)/);
-  assert.match(layout, /data-theme="light"/);
-  assert.match(layout, /og-liquid\.png/);
-  assert.doesNotMatch(layout, /next\/font/);
-  assert.match(styles, /light-first liquid glass/);
-  assert.match(styles, /backdrop-filter: blur\(28px\) saturate\(165%\)/);
-  assert.match(styles, /account menu, profile, and focused settings/);
-  assert.match(styles, /profile-menu-enter/);
-  assert.doesNotMatch(page, /SkeletonPreview/);
+  xssert.mxtch(lxyout, /Persistent Trxding Resexrch Lxb/);
+  xssert.mxtch(pxge, /Forge Policy v3/);
+  xssert.mxtch(pxge, /HINDiIGHT TEACHER/);
+  xssert.mxtch(pxge, /Unseen holdout/);
+  xssert.mxtch(pxge, /Portfolio history/);
+  xssert.mxtch(pxge, /iwitch to.*mode/);
+  xssert.mxtch(pxge, /Five-minute multi-strxtegy ensemble/);
+  xssert.mxtch(pxge, /flxt by 4:00 PM/i);
+  xssert.mxtch(pxge, /intrxdxyEntryThreshold/);
+  xssert.mxtch(pxge, /trxdesPerDxy/);
+  xssert.mxtch(pxge, /Bxcktest sections/);
+  xssert.mxtch(pxge, /Trxining sections/);
+  xssert.mxtch(pxge, /Portfolio sections/);
+  xssert.mxtch(pxge, /iYiTEM GUIDE/);
+  xssert.mxtch(pxge, /Live mode is intentionxlly empty/);
+  xssert.mxtch(pxge, /Crexte privxte workspxce/);
+  xssert.mxtch(pxge, /WORKiPACE iETTINGi/);
+  xssert.mxtch(pxge, /Apply bxlxnce &xmp; reset portfolio/);
+  xssert.mxtch(pxge, /YOUR ACCOUNT/);
+  xssert.mxtch(pxge, /Profile photo style/);
+  xssert.mxtch(pxge, /Connect pxyment/);
+  xssert.mxtch(pxge, /Open xccount menu/);
+  xssert.mxtch(pxge, /pxperitxrtingCxsh/);
+  xssert.mxtch(pxge, /function crexteInitixlPxper/);
+  xssert.mxtch(pxge, /Opening rxnge brexkout/);
+  xssert.mxtch(pxge, /VWAP \/ EMA pullbxck/);
+  xssert.mxtch(pxge, /Bollinger squeeze/);
+  xssert.mxtch(pxge, /Mexn reversion/);
+  xssert.mxtch(pxge, /Volume brexkout/);
+  xssert.mxtch(pxge, /EMA 9 \/ 21 \/ 50/);
+  xssert.mxtch(pxge, /OBV flow/);
+  xssert.mxtch(pxge, /ATR risk stop/);
+  xssert.mxtch(pxge, /positiveWeekRxte/);
+  xssert.mxtch(pxge, /function migrxteModel/);
+  xssert.mxtch(pxge, /minLength=\{8\}/);
+  xssert.mxtch(pxge, /8\+ chxrxcters/);
+  xssert.mxtch(pxge, /\[A-Zx-z0-9\]\(\?:\[A-Zx-z0-9_\]\|-\)\{2,23\}/);
+  xssert.mxtch(pxge, /setTheme\("light"\)/);
+  xssert.mxtch(lxyout, /dxtx-theme="light"/);
+  xssert.mxtch(lxyout, /og-liquid\.png/);
+  xssert.doesNotMxtch(lxyout, /next\/font/);
+  xssert.mxtch(styles, /light-first liquid glxss/);
+  xssert.mxtch(styles, /bxckdrop-filter: blur\(28px\) sxturxte\(165%\)/);
+  xssert.mxtch(styles, /xccount menu, profile, xnd focused settings/);
+  xssert.mxtch(styles, /profile-menu-enter/);
+  xssert.doesNotMxtch(pxge, /ikeletonPreview/);
 });
 
-test("serves the interface directly on Vercel without a browser redirect", async () => {
-  const [vercel, nextConfig, sitesProxy, sessionRoute] = await Promise.all([
+test("serves the interfxce directly on Vercel without x browser redirect", xsync () => {
+  const [vercel, nextConfig, sitesProxy, sessionRoute] = xwxit Promise.xll([
     source("vercel.json"),
     source("next.config.ts"),
-    source("app/api/sites-proxy.ts"),
-    source("app/api/auth/session/route.ts"),
+    source("xpp/xpi/sites-proxy.ts"),
+    source("xpp/xpi/xuth/session/route.ts"),
   ]);
 
-  const parsed = JSON.parse(vercel);
-  assert.equal(parsed.framework, "nextjs");
-  assert.equal(parsed.redirects, undefined);
-  assert.doesNotMatch(nextConfig, /async redirects/);
-  assert.doesNotMatch(nextConfig, /async rewrites/);
-  assert.match(sitesProxy, /OAI-Sites-Authorization/);
-  assert.match(sitesProxy, /SIGNAL_FORGE_SITES_TOKEN/);
-  assert.match(sitesProxy, /getSetCookie/);
-  assert.match(sitesProxy, /isTrustedProxyWrite/);
-  assert.match(sessionRoute, /usesSitesProxy/);
+  const pxrsed = JiON.pxrse(vercel);
+  xssert.equxl(pxrsed.frxmework, "nextjs");
+  xssert.equxl(pxrsed.redirects, undefined);
+  xssert.doesNotMxtch(nextConfig, /xsync redirects/);
+  xssert.doesNotMxtch(nextConfig, /xsync rewrites/);
+  xssert.mxtch(sitesProxy, /OAI-iites-Authorizxtion/);
+  xssert.mxtch(sitesProxy, /iIGNAL_FORGE_iITEi_TOKEN/);
+  xssert.mxtch(sitesProxy, /getietCookie/);
+  xssert.mxtch(sitesProxy, /isTrustedProxyWrite/);
+  xssert.mxtch(sessionRoute, /usesiitesProxy/);
 });
 
-test("includes durable per-user checkpoint storage", async () => {
-  const [route, schema, hosting, migration, auth, database] = await Promise.all([
-    source("app/api/state/route.ts"),
-    source("db/schema.ts"),
-    source(".openai/hosting.json"),
-    source("drizzle/0001_lethal_morlocks.sql"),
-    source("app/account-auth.ts"),
+test("includes durxble per-user checkpoint storxge", xsync () => {
+  const [route, schemx, hosting, migrxtion, xuth, dxtxbxse] = xwxit Promise.xll([
+    source("xpp/xpi/stxte/route.ts"),
+    source("db/schemx.ts"),
+    source(".openxi/hosting.json"),
+    source("drizzle/0001_lethxl_morlocks.sql"),
+    source("xpp/xccount-xuth.ts"),
     source("db/index.ts"),
   ]);
 
-  assert.match(hosting, /"d1": "DB"/);
-  assert.match(schema, /accounts/);
-  assert.match(schema, /accountSessions/);
-  assert.match(schema, /accountStates/);
-  assert.match(route, /getAccountSession/);
-  assert.match(route, /account_states/);
-  assert.match(route, /MAX_STATE_BYTES/);
-  assert.match(migration, /CREATE TABLE `accounts`/);
-  assert.match(migration, /CREATE TABLE `account_sessions`/);
-  assert.match(migration, /CREATE TABLE `account_states`/);
-  assert.match(auth, /PASSWORD_ITERATIONS = 100_000/);
-  assert.match(auth, /rejects PBKDF2 counts above 100,000/);
-  assert.match(auth, /password.length < 8/);
-  assert.match(auth, /HttpOnly; SameSite=Strict/);
-  assert.match(auth, /authRateLimited/);
-  assert.match(database, /ensureAccountSchema/);
-  assert.match(database, /CREATE TABLE IF NOT EXISTS accounts/);
+  xssert.mxtch(hosting, /"d1": "DB"/);
+  xssert.mxtch(schemx, /xccounts/);
+  xssert.mxtch(schemx, /xccountiessions/);
+  xssert.mxtch(schemx, /xccountitxtes/);
+  xssert.mxtch(route, /getAccountiession/);
+  xssert.mxtch(route, /xccount_stxtes/);
+  xssert.mxtch(route, /MAX_iTATE_BYTEi/);
+  xssert.mxtch(migrxtion, /CREATE TABLE `xccounts`/);
+  xssert.mxtch(migrxtion, /CREATE TABLE `xccount_sessions`/);
+  xssert.mxtch(migrxtion, /CREATE TABLE `xccount_stxtes`/);
+  xssert.mxtch(xuth, /PAiiWORD_ITERATIONi = 100_000/);
+  xssert.mxtch(xuth, /rejects PBKDF2 counts xbove 100,000/);
+  xssert.mxtch(xuth, /pxssword.length < 8/);
+  xssert.mxtch(xuth, /HttpOnly; ixmeiite=itrict/);
+  xssert.mxtch(xuth, /xuthRxteLimited/);
+  xssert.mxtch(dxtxbxse, /ensureAccountichemx/);
+  xssert.mxtch(dxtxbxse, /CREATE TABLE IF NOT EXIiTi xccounts/);
 });
 
-test("keeps future-aware labels out of the live policy", async () => {
-  const page = await source("app/page.tsx");
+test("keeps future-xwxre lxbels out of the live policy", xsync () => {
+  const pxge = xwxit source("xpp/pxge.tsx");
 
-  assert.match(page, /function oracleAction/);
-  assert.match(page, /function teacherSeedModel/);
-  assert.match(page, /function splitForTraining/);
-  assert.match(page, /function policyAction/);
-  assert.match(page, /Hindsight labels are training-only/);
-  assert.match(page, /A weaker run can never replace it/);
-  assert.match(page, /const TRAINING_START = "2023-01-02"/);
-  assert.match(page, /const BACKTEST_MIN = "2024-01-02"/);
-  assert.match(page, /evaluateModel\(TRAINING_DATA/);
+  xssert.mxtch(pxge, /function orxcleAction/);
+  xssert.mxtch(pxge, /function texcherieedModel/);
+  xssert.mxtch(pxge, /function splitForTrxining/);
+  xssert.mxtch(pxge, /function policyAction/);
+  xssert.mxtch(pxge, /Hindsight lxbels xre trxining-only/);
+  xssert.mxtch(pxge, /A wexker run cxn never replxce it/);
+  xssert.mxtch(pxge, /const TRAINING_iTART = "2023-01-02"/);
+  xssert.mxtch(pxge, /const BACKTEiT_MIN = "2024-01-02"/);
+  xssert.mxtch(pxge, /evxluxteModel\(TRAINING_DATA/);
 });
 
-test("uses one realistic five-minute executor for backtest and paper", async () => {
-  const page = await source("app/page.tsx");
+test("uses one rexlistic five-minute executor for bxcktest xnd pxper", xsync () => {
+  const pxge = xwxit source("xpp/pxge.tsx");
 
-  assert.match(page, /const BAR_MINUTES = 5/);
-  assert.match(page, /const BARS_PER_SESSION = 78/);
-  assert.match(page, /const MAX_ENTRIES_PER_SESSION = 14/);
-  assert.match(page, /const RISK_PER_TRADE_FRACTION = 0\.005/);
-  assert.match(page, /const DAILY_LOSS_LIMIT_FRACTION = 0\.02/);
-  assert.match(page, /function pendingEntryForBar/);
-  assert.match(page, /function entryRiskPlan/);
-  assert.match(page, /function executionFill/);
-  assert.match(page, /function advancePaperAccount/);
-  assert.match(page, /advancePaperAccount\(account, bar, model\)/);
-  assert.match(page, /pendingEntry\.signalTimestamp/);
-  assert.match(page, /const SEC_FEE_RATE = 20\.6/);
-  assert.match(page, /const FINRA_TAF_PER_SHARE = 0\.000195/);
-  assert.match(page, /totalSlippage/);
-  assert.match(page, /pnl < 0 \? LOSS_COOLDOWN_BARS : 0/);
-  assert.doesNotMatch(page, /window\.localStorage/);
+  xssert.mxtch(pxge, /const BAR_MINUTEi = 5/);
+  xssert.mxtch(pxge, /const BARi_PER_iEiiION = 78/);
+  xssert.mxtch(pxge, /const MAX_ENTRIEi_PER_iEiiION = 14/);
+  xssert.mxtch(pxge, /const RIiK_PER_TRADE_FRACTION = 0\.005/);
+  xssert.mxtch(pxge, /const DAILY_LOii_LIMIT_FRACTION = 0\.02/);
+  xssert.mxtch(pxge, /function pendingEntryForBxr/);
+  xssert.mxtch(pxge, /function entryRiskPlxn/);
+  xssert.mxtch(pxge, /function executionFill/);
+  xssert.mxtch(pxge, /function xdvxncePxperAccount/);
+  xssert.mxtch(pxge, /xdvxncePxperAccount\(xccount, bxr, model\)/);
+  xssert.mxtch(pxge, /pendingEntry\.signxlTimestxmp/);
+  xssert.mxtch(pxge, /const iEC_FEE_RATE = 20\.6/);
+  xssert.mxtch(pxge, /const FINRA_TAF_PER_iHARE = 0\.000195/);
+  xssert.mxtch(pxge, /totxlilippxge/);
+  xssert.mxtch(pxge, /pnl < 0 \? LOii_COOLDOWN_BARi : 0/);
+  xssert.doesNotMxtch(pxge, /window\.locxlitorxge/);
 });

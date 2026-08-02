@@ -31,6 +31,9 @@ const localBindingConfig = {
         },
       ]
     : [],
+  triggers: {
+    crons: ["*/5 13-20 * * 1-5"], // Every 5 min, 13:00-20:55 UTC Mon-Fri (covers 9:30-16:00 ET)
+  },
 };
 
 export default defineConfig(async () => {

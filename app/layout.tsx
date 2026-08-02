@@ -12,7 +12,7 @@ export async function generateMetadata(): Promise<Metadata> {
     requestHeaders.get("x-forwarded-proto") ??
     (host.includes("localhost") ? "http" : "https");
   const origin = `${protocol}://${host}`;
-  const title = "Signal Forge - Persistent Trading Research Lab";
+  const title = "Axion Trades";
   const description =
     "A persistent AAPL intraday research lab with a regime-aware ORB, VWAP, EMA, Bollinger, momentum, volume, and key-level strategy ensemble.";
 
@@ -33,7 +33,7 @@ export async function generateMetadata(): Promise<Metadata> {
       description,
       type: "website",
       url: origin,
-      images: [{ url: `${origin}/og-liquid.png`, alt: "Signal Forge liquid-glass market research artwork" }],
+      images: [{ url: `${origin}/og-liquid.png`, alt: "axion-trades liquid-glass market research artwork" }],
     },
     twitter: {
       card: "summary_large_image",

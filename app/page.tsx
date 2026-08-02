@@ -131,6 +131,7 @@ type LabPreferences = {
   paperStartingCash: number;
   launchView: LaunchView;
   animations: boolean;
+  autoRun: boolean;
 };
 
 type PendingEntry = {
@@ -300,6 +301,7 @@ const INITIAL_PREFERENCES: LabPreferences = {
   paperStartingCash: PAPER_STARTING_CASH,
   launchView: "chart",
   animations: true,
+  autoRun: false,
 };
 
 function createInitialPaper(startingCash = PAPER_STARTING_CASH): PaperAccount {
@@ -2419,6 +2421,7 @@ function normalizePreferences(value: unknown): LabPreferences {
     ),
     launchView,
     animations: preferences.animations !== false,
+    autoRun: preferences.autoRun === true,
   };
 }
 
@@ -2709,6 +2712,37 @@ export default function Home() {
       cancelled = true;
     };
   }, [accountStatus, accountUser]);
+
+  // Poll for server-side updates when auto-run is enabled
+  useEffect(() => {
+    if (!hydrated || accountStatus !== "authenticated" || !accountUser || !preferences.autoRun) return;
+    let cancelled = false;
+    const pollInterval = window.setInterval(async () => {
+      if (cancelled) return;
+      try {
+        const response = await fetch("/api/state", { cache: "no-store" });
+        if (!response.ok) return;
+        const body = (await response.json()) as { state?: unknown };
+        const saved = normalizePersistedState(body.state);
+        if (!saved || cancelled) return;
+        // Only update paper state to avoid overwriting local UI changes
+        setPaper(saved.paper);
+        setPreferences(saved.preferences);
+        const savedBarIndex = PAPER_STREAM.findIndex((bar) => bar.timestamp === saved.paper.lastBarTimestamp);
+        const nextIndex = savedBarIndex < 0 ? 0 : Math.min(PAPER_STREAM.length, savedBarIndex + 1);
+        setPaperBarIndex(nextIndex);
+        setPaperPrice(savedBarIndex < 0
+          ? (PAPER_STREAM[0]?.open ?? MARKET_DATA[MARKET_DATA.length - 1].close)
+          : PAPER_STREAM[savedBarIndex].close);
+      } catch {
+        // Silent fail - will retry on next interval
+      }
+    }, 30_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(pollInterval);
+    };
+  }, [hydrated, accountStatus, accountUser, preferences.autoRun]);
 
   useEffect(() => {
     if (!hydrated || accountStatus !== "authenticated" || !accountUser) return;
@@ -3010,7 +3044,7 @@ export default function Home() {
   };
 
   const saveProfile = () => {
-    const displayName = profileNameDraft.trim().slice(0, 32) || accountUser?.username || "Signal Forge";
+    const displayName = profileNameDraft.trim().slice(0, 32) || accountUser?.username || "Axion Trades";
     setProfile({ displayName, avatarPreset: avatarDraft });
     setProfileNameDraft(displayName);
     setToast("Profile saved to your account");
@@ -3042,7 +3076,7 @@ export default function Home() {
     { label: "Volume breakout", value: latestDecision.algorithms.breakout, detail: "ORB · levels · OBV flow" },
   ];
 
-  const accountDisplayName = profile.displayName || accountUser?.username || "Signal Forge";
+  const accountDisplayName = profile.displayName || accountUser?.username || "Axion Trades";
   const accountInitials = initialsFromName(accountDisplayName);
   const avatarPresets: Array<{ id: AvatarPreset; label: string }> = [
     { id: "mint", label: "Mint" },
@@ -3104,9 +3138,9 @@ export default function Home() {
     return (
       <main className="gateway-shell">
         <header className="gateway-header">
-          <a className="brand" href="#account" aria-label="Signal Forge account">
+          <a className="brand" href="#account" aria-label="Axion Trades account">
             <span className="brand-mark" aria-hidden="true" />
-            <span>Signal <b>Forge</b></span>
+            <span>Axion <b>Trades</b></span>
             <em>LAB</em>
           </a>
           <button className="theme-toggle" type="button" onClick={() => setTheme((current) => current === "dark" ? "light" : "dark")} aria-label="Toggle color theme">
@@ -3157,7 +3191,7 @@ export default function Home() {
     return (
       <main className="gateway-shell mode-shell">
         <header className="gateway-header">
-          <a className="brand" href="#mode" aria-label="Signal Forge mode selection"><span className="brand-mark" aria-hidden="true" /><span>Signal <b>Forge</b></span><em>LAB</em></a>
+          <a className="brand" href="#mode" aria-label="Axion Trades mode selection"><span className="brand-mark" aria-hidden="true" /><span>Axion <b>Trades</b></span><em>LAB</em></a>
           <div className="gateway-account-actions">
             <button className="theme-toggle" type="button" onClick={() => setTheme((current) => current === "dark" ? "light" : "dark")} aria-label="Toggle color theme">{theme === "dark" ? <Sun size={16} /> : <Moon size={16} />}</button>
             {renderProfileMenu()}
@@ -3183,7 +3217,7 @@ export default function Home() {
     return (
       <main className="app-shell refined-shell live-empty-shell">
         <header className="topbar refined-topbar live-empty-topbar">
-          <a className="brand" href="#live"><span className="brand-mark" aria-hidden="true" /><span>Signal <b>Forge</b></span><em>LIVE</em></a>
+          <a className="brand" href="#live"><span className="brand-mark" aria-hidden="true" /><span>Axion <b>Trades</b></span><em>LIVE</em></a>
           <div className="live-mode-pill"><span /> Live workspace</div>
           <div className="top-actions">
             <button className="theme-toggle" type="button" onClick={() => setTheme((current) => current === "dark" ? "light" : "dark")} aria-label="Toggle color theme">{theme === "dark" ? <Sun size={16} /> : <Moon size={16} />}</button>
@@ -3206,9 +3240,9 @@ export default function Home() {
   return (
     <main className="app-shell refined-shell">
       <header className="topbar refined-topbar">
-        <a className="brand" href="#workspace" aria-label="Signal Forge home">
+        <a className="brand" href="#workspace" aria-label="Axion Trades home">
           <span className="brand-mark" aria-hidden="true" />
-          <span>Signal <b>Forge</b></span>
+          <span>Axion <b>Trades</b></span>
           <em>SIM</em>
         </a>
 
@@ -3807,6 +3841,10 @@ export default function Home() {
                     <div><strong>Interface motion</strong><small>Turns decorative movement and transitions on or off.</small></div>
                     <button className={`switch-control ${preferences.animations ? "on" : ""}`} type="button" role="switch" aria-checked={preferences.animations} onClick={() => setPreferences((current) => ({ ...current, animations: !current.animations }))}><span /></button>
                   </div>
+                  <div className="setting-row">
+                    <div><strong>Auto-run paper bot</strong><small>Automatically start the paper bot at market open (9:30 ET) and stop at close (16:00 ET), even when your device is off.</small></div>
+                    <button className={`switch-control ${preferences.autoRun ? "on" : ""}`} type="button" role="switch" aria-checked={preferences.autoRun} onClick={() => setPreferences((current) => ({ ...current, autoRun: !current.autoRun }))}><span /></button>
+                  </div>
                 </article>
 
                 <article className="settings-card">
@@ -3854,7 +3892,7 @@ export default function Home() {
               <article className="account-profile-card">
                 <div className="profile-hero">
                   <span className="avatar account-hero-avatar" data-avatar={avatarDraft}>{initialsFromName(profileNameDraft || accountDisplayName)}</span>
-                  <div><small>PROFILE PREVIEW</small><h3>{profileNameDraft || accountDisplayName}</h3><p>@{accountUser?.username} / Signal Forge member</p></div>
+                  <div><small>PROFILE PREVIEW</small><h3>{profileNameDraft || accountDisplayName}</h3><p>@{accountUser?.username} / Axion Trades member</p></div>
                 </div>
 
                 <div className="account-form-grid">
@@ -3909,7 +3947,7 @@ export default function Home() {
             <div className="workspace-heading guide-heading">
               <div>
                 <span className="view-kicker">SYSTEM GUIDE</span>
-                <h2>How Signal Forge actually works</h2>
+                <h2>How Axion Trades actually works</h2>
                 <p>The exact data boundaries, learning loop, order timing, cost assumptions, account model, and limits—without marketing language.</p>
               </div>
               <span className="training-status"><ShieldCheck size={14} /> Sandbox only</span>

@@ -51,7 +51,7 @@ export async function POST(request: Request) {
       { status: 201, headers: { "set-cookie": session.cookie } },
     );
   } catch (error) {
-    console.error("Signal Forge registration failed", error);
+    console.error("axion-trades registration failed", error);
     return noStoreJson({ error: "The account service is temporarily unavailable." }, { status: 503 });
   }
 }
