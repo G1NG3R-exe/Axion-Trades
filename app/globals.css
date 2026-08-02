@@ -4697,7 +4697,7 @@ body {
     var(--sf-page);
 }
 
-:root[data-theme="light"] .avatar {
+:root[data-theme="light"] .avatar:not([data-avatar]) {
   background: #e8efeb;
   border-color: var(--sf-border);
   color: #31423b;
