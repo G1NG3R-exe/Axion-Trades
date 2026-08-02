@@ -5054,18 +5054,20 @@ body {
 @media (max-width: 760px) {
   .refined-topbar {
     grid-template-columns: 1fr auto;
+    height: 58px;
+    padding-inline: max(13px, env(safe-area-inset-left)) max(13px, env(safe-area-inset-right));
   }
 
   .primary-nav {
     backdrop-filter: blur(18px);
     background: color-mix(in srgb, var(--sf-surface) 92%, transparent);
-    bottom: 12px;
+    bottom: max(12px, env(safe-area-inset-bottom));
     box-shadow: 0 16px 50px rgba(0, 0, 0, 0.28);
     justify-content: stretch;
-    left: 12px;
+    left: max(12px, env(safe-area-inset-left));
     padding: 4px;
     position: fixed;
-    right: 12px;
+    right: max(12px, env(safe-area-inset-right));
     z-index: 90;
   }
 
@@ -5083,7 +5085,7 @@ body {
   }
 
   .refined-dashboard {
-    padding-bottom: 88px;
+    padding-bottom: calc(96px + env(safe-area-inset-bottom));
   }
 
   .focused-workspace {
@@ -5093,7 +5095,13 @@ body {
   .page-subtabs {
     gap: 19px;
     overflow-x: auto;
+    scrollbar-width: none;
+    scroll-padding-inline: 2px;
+    scroll-snap-type: x proximity;
   }
+
+  .page-subtabs::-webkit-scrollbar { display: none; }
+  .page-subtabs button { flex: 0 0 auto; scroll-snap-align: start; }
 
   .automation-rules {
     grid-template-columns: 1fr;
@@ -5987,4 +5995,100 @@ button:disabled { cursor: not-allowed !important; opacity: 0.48; transform: none
   .capital-preview strong { font-size: 25px; }
   .profile-hero { align-items: flex-start; }
   .account-hero-avatar { height: 52px; width: 52px; }
+}
+
+/* Phone ergonomics: keep the data-dense workspace readable without forcing
+   sideways scrolling or placing important controls beneath the bottom dock. */
+@media (max-width: 650px) {
+  .command-center,
+  .focused-workspace {
+    padding: 15px;
+  }
+
+  .instrument-focus {
+    align-items: flex-start;
+  }
+
+  .instrument-copy > p {
+    line-height: 1.45;
+  }
+
+  .range-fields input,
+  .run-button {
+    min-height: 44px;
+  }
+
+  .page-subtabs {
+    min-height: 44px;
+    margin-top: 17px;
+  }
+
+  .page-subtabs button {
+    min-height: 43px;
+  }
+
+  .chart-summary-line {
+    gap: 8px 12px;
+    margin-top: 14px;
+  }
+
+  .chart-workspace .chart-frame {
+    height: min(112vw, 455px);
+    min-height: 330px;
+  }
+
+  .chart-tooltip {
+    max-width: calc(100% - 24px);
+    right: 12px;
+    width: 212px;
+  }
+
+  .paper-account-top {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  .paper-actions .primary-button,
+  .paper-actions .secondary-button {
+    flex: 1 1 145px;
+    min-height: 44px;
+  }
+}
+
+@media (max-width: 390px) {
+  .brand {
+    font-size: 14px;
+    gap: 7px;
+  }
+
+  .brand-mark {
+    height: 29px;
+    width: 29px;
+  }
+
+  .theme-toggle {
+    height: 36px;
+    width: 36px;
+  }
+
+  .instrument-copy > p,
+  .chart-summary-line span:nth-child(n + 4) {
+    display: none;
+  }
+
+  .outcome-item {
+    min-height: 102px;
+    padding: 12px;
+  }
+
+  .outcome-item > span:first-child,
+  .outcome-item small {
+    font-size: 9px;
+  }
+
+  .chart-workspace .chart-frame {
+    height: 330px;
+    min-height: 0;
+  }
 }
