@@ -35,13 +35,13 @@ export async function proxySitesRequest(request: Request) {
     return noStoreJson({ error: "Request origin was rejected." }, 403);
   }
 
-  const token = process.env.SIGNAL_FORGE_SITES_TOKEN;
+  const token = process.env.AXION_TRADES_SITES_TOKEN;
   if (!token) {
     return noStoreJson({ error: "The account bridge is not configured." }, 503);
   }
 
   const incomingUrl = new URL(request.url);
-  const backend = process.env.SIGNAL_FORGE_BACKEND_URL ?? DEFAULT_SITES_BACKEND;
+  const backend = process.env.AXION_TRADES_BACKEND_URL ?? DEFAULT_SITES_BACKEND;
   const target = new URL(`${incomingUrl.pathname}${incomingUrl.search}`, backend);
   const headers = new Headers();
   for (const name of ["accept", "accept-language", "content-type", "cookie", "user-agent"]) {

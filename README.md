@@ -1,6 +1,6 @@
 # Axion Trades
 
-Axion Trades (Signal Forge) is a trading-research sandbox for exploring a simulated, AAPL-like instrument. It provides backtesting, a five-minute paper-trading replay, account-backed workspaces, and model configuration in a single application.
+Axion Trades is a trading-research sandbox for exploring a simulated, AAPL-like instrument. It provides backtesting, a five-minute paper-trading replay, account-backed workspaces, and model configuration in a single application.
 
 > **Simulation only.** This project does not connect to a broker, place orders, or provide investment advice. Market data and execution are simulated; results are not evidence that a strategy will be profitable.
 
@@ -78,8 +78,8 @@ The Cloudflare D1 binding is named `DB` and is declared in `.openai/hosting.json
 
 Depending on the deployment target, the application may also use:
 
-- `SIGNAL_FORGE_SITES_TOKEN`
-- `SIGNAL_FORGE_BACKEND_URL`
+- `AXION_TRADES_SITES_TOKEN`
+- `AXION_TRADES_BACKEND_URL`
 
 Do not commit or share `.env.local`, `cookies.txt`, tokens, passwords, API keys, or authentication secrets. Generated and local-only directories, including `node_modules/`, `.next/`, `dist/`, `.vercel/`, `.wrangler/`, `.vinext/`, `outputs/`, and `work/`, should remain untracked.
 
