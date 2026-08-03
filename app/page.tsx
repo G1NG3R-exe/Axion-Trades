@@ -2520,7 +2520,6 @@ export default function Home() {
   const [trainingTab, setTrainingTab] = useState<"run" | "checkpoints" | "policy">("run");
   const [portfolioTab, setPortfolioTab] = useState<"account" | "orders" | "automation">("account");
   const [theme, setTheme] = useState<"light" | "dark">("light");
-  const [themeReady, setThemeReady] = useState(false);
   const [model, setModel] = useState(INITIAL_MODEL);
   const [isRunning, setIsRunning] = useState(false);
   const [rangeError, setRangeError] = useState("");
@@ -2595,17 +2594,8 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    const timer = window.setTimeout(() => {
-      setTheme("light");
-      setThemeReady(true);
-    }, 0);
-    return () => window.clearTimeout(timer);
-  }, []);
-
-  useEffect(() => {
-    if (!themeReady) return;
     document.documentElement.dataset.theme = theme;
-  }, [theme, themeReady]);
+  }, [theme]);
 
   useEffect(() => {
     document.documentElement.dataset.motion = preferences.animations ? "full" : "reduced";
@@ -2670,6 +2660,7 @@ export default function Home() {
         const body = (await response.json()) as { state?: unknown };
         const saved = normalizePersistedState(body.state);
         if (!cancelled && saved) {
+          document.documentElement.dataset.theme = saved.theme;
           setModel(saved.model);
           setTheme(saved.theme);
           setTrainingEpoch(saved.trainingEpoch);
@@ -2704,7 +2695,10 @@ export default function Home() {
           setHydrated(true);
         }
       } catch {
-        if (!cancelled) setSyncStatus("offline");
+        if (!cancelled) {
+          setSyncStatus("offline");
+          setHydrated(true);
+        }
       }
     };
     void loadPersistentState();
@@ -3183,6 +3177,20 @@ export default function Home() {
             <small className="auth-disclaimer">No email verification yet. Use a unique password; account recovery and MFA are not available in this prototype.</small>
           </form>
         </section>
+      </main>
+    );
+  }
+
+  if (accountStatus === "authenticated" && !hydrated) {
+    return (
+      <main className="gateway-shell" aria-busy="true">
+        <div className="gateway-loading" role="status" aria-live="polite">
+          <span className="brand-mark gateway-brand-mark" aria-hidden="true" />
+          <span className="skeleton-line headline" />
+          <span className="skeleton-line medium" />
+          <div className="gateway-loading-grid"><i /><i /></div>
+          <small>Loading your saved research lab...</small>
+        </div>
       </main>
     );
   }
