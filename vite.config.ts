@@ -20,6 +20,7 @@ const localBindingConfig = {
           binding: d1,
           database_name: AXION_TRADES_DATABASE_NAME,
           database_id: AXION_TRADES_DATABASE_ID,
+          migrations_dir: "drizzle",
         },
       ]
     : [],
