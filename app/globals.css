@@ -5146,6 +5146,7 @@ body {
   --glass-highlight: rgba(255, 255, 255, 0.96);
   --glass-shadow: 0 24px 72px rgba(42, 75, 64, 0.13), 0 3px 12px rgba(42, 75, 64, 0.05);
   --glass-shadow-hover: 0 30px 86px rgba(35, 91, 72, 0.18), 0 8px 20px rgba(42, 75, 64, 0.07);
+  --mode-card-sheen: color-mix(in srgb, var(--mint) 34%, transparent);
 }
 
 :root[data-theme="dark"] {
@@ -5157,6 +5158,7 @@ body {
   --glass-highlight: rgba(255, 255, 255, 0.11);
   --glass-shadow: 0 28px 78px rgba(0, 0, 0, 0.31), 0 3px 12px rgba(0, 0, 0, 0.2);
   --glass-shadow-hover: 0 34px 90px rgba(0, 0, 0, 0.4), 0 8px 24px rgba(0, 0, 0, 0.24);
+  --mode-card-sheen: color-mix(in srgb, var(--mint) 30%, transparent);
 }
 
 body {
@@ -5371,7 +5373,7 @@ body {
 }
 
 .mode-card::before {
-  background: linear-gradient(115deg, transparent 22%, rgba(255, 255, 255, 0.6) 45%, transparent 67%);
+  background: linear-gradient(115deg, transparent 22%, var(--mode-card-sheen) 45%, transparent 67%);
   content: "";
   height: 180%;
   left: -95%;
