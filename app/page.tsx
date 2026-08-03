@@ -97,6 +97,11 @@ type MarketBar = {
   obvSlope: number;
 };
 
+type RawMarketBar = Pick<
+  MarketBar,
+  "date" | "time" | "timestamp" | "barInSession" | "open" | "high" | "low" | "close" | "volume"
+>;
+
 type ModelWeights = {
   trend: number;
   rsi: number;
@@ -260,7 +265,7 @@ const DATA_START = TRAINING_START;
 const DATA_END = "2026-07-29";
 const BACKTEST_MIN = "2024-01-02";
 const DEFAULT_START = "2024-01-02";
-const DEFAULT_END = "2025-12-31";
+const DEFAULT_END = DATA_END;
 const STATE_VERSION = 7;
 const MODEL_STATE_VERSION = 6;
 const BAR_MINUTES = 5;
@@ -549,6 +554,11 @@ function generateMarketData(): MarketBar[] {
     cursor.setUTCDate(cursor.getUTCDate() + 1);
   }
 
+  return enrichMarketData(raw);
+}
+
+function enrichMarketData(raw: RawMarketBar[]): MarketBar[] {
+  if (!raw.length) return [];
   const closes = raw.map((bar) => bar.close);
   const returns = closes.map((close, index) => index === 0 ? 0 : close / closes[index - 1] - 1);
   let fast = closes[0];
@@ -722,12 +732,32 @@ function generateMarketData(): MarketBar[] {
   });
 }
 
-const MARKET_DATA = generateMarketData();
-const TRAINING_DATA = MARKET_DATA.filter(
+const STATIC_MARKET_DATA = generateMarketData();
+const TRAINING_DATA = STATIC_MARKET_DATA.filter(
   (bar) => bar.date >= TRAINING_START && bar.date <= TRAINING_END,
 );
-const PAPER_SESSION_DATE = MARKET_DATA[MARKET_DATA.length - 1]?.date ?? DATA_END;
-const PAPER_STREAM = MARKET_DATA.filter((bar) => bar.date === PAPER_SESSION_DATE);
+
+function toRawMarketBar(bar: MarketBar): RawMarketBar {
+  return {
+    date: bar.date,
+    time: bar.time,
+    timestamp: bar.timestamp,
+    barInSession: bar.barInSession,
+    open: bar.open,
+    high: bar.high,
+    low: bar.low,
+    close: bar.close,
+    volume: bar.volume,
+  };
+}
+
+function mergeLiveMarketData(liveBars: RawMarketBar[]): MarketBar[] {
+  const bars = new Map<string, RawMarketBar>(
+    STATIC_MARKET_DATA.map((bar) => [bar.timestamp, toRawMarketBar(bar)]),
+  );
+  for (const bar of liveBars) bars.set(bar.timestamp, bar);
+  return enrichMarketData([...bars.values()].sort((a, b) => a.timestamp.localeCompare(b.timestamp)));
+}
 
 function scoreBar(bar: MarketBar, weights: ModelWeights, explain = true) {
   const atrUnit = Math.max(bar.atr, bar.close * 0.0015);
@@ -2501,7 +2531,6 @@ function normalizePersistedState(value: unknown): PersistedLabState | null {
       typeof range.start === "string" &&
       typeof range.end === "string" &&
       range.start >= BACKTEST_MIN &&
-      range.end <= DATA_END &&
       range.start < range.end
       ? range
       : { start: DEFAULT_START, end: DEFAULT_END },
@@ -2511,6 +2540,9 @@ function normalizePersistedState(value: unknown): PersistedLabState | null {
 }
 
 export default function Home() {
+  const [marketData, setMarketData] = useState(STATIC_MARKET_DATA);
+  const [marketDataStatus, setMarketDataStatus] = useState<"loading" | "live" | "fallback">("loading");
+  const [dataEnd, setDataEnd] = useState(DATA_END);
   const [draftStart, setDraftStart] = useState(DEFAULT_START);
   const [draftEnd, setDraftEnd] = useState(DEFAULT_END);
   const [range, setRange] = useState({ start: DEFAULT_START, end: DEFAULT_END });
@@ -2540,7 +2572,11 @@ export default function Home() {
   const [clock, setClock] = useState<Date | null>(null);
   const [paperActive, setPaperActive] = useState(false);
   const [replayMode, setReplayMode] = useState(false);
-  const [paperPrice, setPaperPrice] = useState(PAPER_STREAM[0]?.open ?? MARKET_DATA[MARKET_DATA.length - 1].close);
+  const paperStream = useMemo(() => {
+    const latestDate = marketData[marketData.length - 1]?.date ?? DATA_END;
+    return marketData.filter((bar) => bar.date === latestDate);
+  }, [marketData]);
+  const [paperPrice, setPaperPrice] = useState(() => paperStream[0]?.open ?? marketData[marketData.length - 1].close);
   const [paperBarIndex, setPaperBarIndex] = useState(0);
   const [paper, setPaper] = useState<PaperAccount>({ ...INITIAL_PAPER });
   const [profile, setProfile] = useState<UserProfile>({ ...INITIAL_PROFILE });
@@ -2554,8 +2590,8 @@ export default function Home() {
   const profileMenuRef = useRef<HTMLDivElement | null>(null);
 
   const filteredData = useMemo(
-    () => MARKET_DATA.filter((bar) => bar.date >= range.start && bar.date <= range.end),
-    [range],
+    () => marketData.filter((bar) => bar.date >= range.start && bar.date <= range.end),
+    [marketData, range],
   );
   const result = useMemo(() => runBacktest(filteredData, model), [filteredData, model]);
   const sessionCount = useMemo(() => new Set(filteredData.map((bar) => bar.date)).size, [filteredData]);
@@ -2563,7 +2599,7 @@ export default function Home() {
     () => (TRAINING_DATA.length >= BARS_PER_SESSION * 30 ? evaluateModel(TRAINING_DATA, model) : null),
     [model],
   );
-  const latest = filteredData[filteredData.length - 1] ?? MARKET_DATA[MARKET_DATA.length - 1];
+  const latest = filteredData[filteredData.length - 1] ?? marketData[marketData.length - 1];
   const previous = filteredData[filteredData.length - 2] ?? latest;
   const dayMove = latest.close / previous.close - 1;
   const latestDecision = useMemo(() => scoreBar(latest, model), [latest, model]);
@@ -2591,6 +2627,33 @@ export default function Home() {
       window.clearTimeout(immediate);
       window.clearInterval(timer);
     };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const syncMarketData = async () => {
+      try {
+        const response = await fetch("/api/market-data?symbol=AAPL", { cache: "no-store" });
+        const body = await response.json() as { bars?: RawMarketBar[]; error?: string };
+        if (!response.ok || !Array.isArray(body.bars) || !body.bars.length) {
+          throw new Error(body.error || "Live market data unavailable");
+        }
+        const nextMarketData = mergeLiveMarketData(body.bars);
+        const latestDate = nextMarketData[nextMarketData.length - 1]?.date ?? DATA_END;
+        const nextPaperStream = nextMarketData.filter((bar) => bar.date === latestDate);
+        if (cancelled) return;
+        setMarketData(nextMarketData);
+        setMarketDataStatus("live");
+        setDataEnd(latestDate);
+        setDraftEnd((current) => current === DEFAULT_END ? latestDate : current);
+        setRange((current) => current.end === DEFAULT_END ? { ...current, end: latestDate } : current);
+        setPaperPrice((current) => nextPaperStream[0]?.open ?? current);
+      } catch {
+        if (!cancelled) setMarketDataStatus("fallback");
+      }
+    };
+    void syncMarketData();
+    return () => { cancelled = true; };
   }, []);
 
   useEffect(() => {
@@ -2675,12 +2738,12 @@ export default function Home() {
           setRange(saved.range);
           setDraftStart(saved.range.start);
           setDraftEnd(saved.range.end);
-          const savedBarIndex = PAPER_STREAM.findIndex((bar) => bar.timestamp === saved.paper.lastBarTimestamp);
-          const nextIndex = savedBarIndex < 0 ? 0 : Math.min(PAPER_STREAM.length, savedBarIndex + 1);
+          const savedBarIndex = paperStream.findIndex((bar) => bar.timestamp === saved.paper.lastBarTimestamp);
+          const nextIndex = savedBarIndex < 0 ? 0 : Math.min(paperStream.length, savedBarIndex + 1);
           setPaperBarIndex(nextIndex);
           setPaperPrice(savedBarIndex < 0
-            ? (PAPER_STREAM[0]?.open ?? MARKET_DATA[MARKET_DATA.length - 1].close)
-            : PAPER_STREAM[savedBarIndex].close);
+            ? (paperStream[0]?.open ?? marketData[marketData.length - 1].close)
+            : paperStream[savedBarIndex].close);
         } else if (!cancelled) {
           const newProfile = { ...INITIAL_PROFILE, displayName: accountUser.username };
           setProfile(newProfile);
@@ -2705,7 +2768,7 @@ export default function Home() {
     return () => {
       cancelled = true;
     };
-  }, [accountStatus, accountUser]);
+  }, [accountStatus, accountUser, marketData, paperStream]);
 
   // Poll for server-side updates when auto-run is enabled
   useEffect(() => {
@@ -2722,12 +2785,12 @@ export default function Home() {
         // Only update paper state to avoid overwriting local UI changes
         setPaper(saved.paper);
         setPreferences(saved.preferences);
-        const savedBarIndex = PAPER_STREAM.findIndex((bar) => bar.timestamp === saved.paper.lastBarTimestamp);
-        const nextIndex = savedBarIndex < 0 ? 0 : Math.min(PAPER_STREAM.length, savedBarIndex + 1);
+        const savedBarIndex = paperStream.findIndex((bar) => bar.timestamp === saved.paper.lastBarTimestamp);
+        const nextIndex = savedBarIndex < 0 ? 0 : Math.min(paperStream.length, savedBarIndex + 1);
         setPaperBarIndex(nextIndex);
         setPaperPrice(savedBarIndex < 0
-          ? (PAPER_STREAM[0]?.open ?? MARKET_DATA[MARKET_DATA.length - 1].close)
-          : PAPER_STREAM[savedBarIndex].close);
+          ? (paperStream[0]?.open ?? marketData[marketData.length - 1].close)
+          : paperStream[savedBarIndex].close);
       } catch {
         // Silent fail - will retry on next interval
       }
@@ -2736,7 +2799,7 @@ export default function Home() {
       cancelled = true;
       window.clearInterval(pollInterval);
     };
-  }, [hydrated, accountStatus, accountUser, preferences.autoRun]);
+  }, [hydrated, accountStatus, accountUser, marketData, paperStream, preferences.autoRun]);
 
   useEffect(() => {
     if (!hydrated || accountStatus !== "authenticated" || !accountUser) return;
@@ -2785,21 +2848,21 @@ export default function Home() {
 
   useEffect(() => {
     if (!paperActive || (!marketClock.isOpen && !replayMode)) return;
-    if (paperBarIndex >= PAPER_STREAM.length) return;
+    if (paperBarIndex >= paperStream.length) return;
     const delay = replayMode ? 850 : BAR_MINUTES * 60 * 1000;
     const timer = window.setTimeout(() => {
-      const bar = PAPER_STREAM[paperBarIndex];
+      const bar = paperStream[paperBarIndex];
       setPaper((account) => advancePaperAccount(account, bar, model));
       setPaperPrice(bar.close);
       setPaperBarIndex((index) => index + 1);
-      if (paperBarIndex === PAPER_STREAM.length - 1) {
+      if (paperBarIndex === paperStream.length - 1) {
         setPaperActive(false);
         setReplayMode(false);
         setToast("Sandbox session complete / every five-minute candle processed");
       }
     }, delay);
     return () => window.clearTimeout(timer);
-  }, [marketClock.isOpen, model, paperActive, paperBarIndex, replayMode]);
+  }, [marketClock.isOpen, model, paperActive, paperBarIndex, paperStream, replayMode]);
 
   const submitAuth = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -2827,7 +2890,7 @@ export default function Home() {
       setDraftStart(DEFAULT_START);
       setDraftEnd(DEFAULT_END);
       setPaperBarIndex(0);
-      setPaperPrice(PAPER_STREAM[0]?.open ?? MARKET_DATA[MARKET_DATA.length - 1].close);
+      setPaperPrice(paperStream[0]?.open ?? marketData[marketData.length - 1].close);
       setHydrated(false);
       setAccountUser(body.user);
       setAccountStatus("authenticated");
@@ -2862,7 +2925,7 @@ export default function Home() {
       setProfileMenuOpen(false);
       setPaper(createInitialPaper(INITIAL_PREFERENCES.paperStartingCash));
       setPaperBarIndex(0);
-      setPaperPrice(PAPER_STREAM[0]?.open ?? MARKET_DATA[MARKET_DATA.length - 1].close);
+      setPaperPrice(paperStream[0]?.open ?? marketData[marketData.length - 1].close);
     }
   };
 
@@ -2875,7 +2938,7 @@ export default function Home() {
       setRangeError(`Backtests begin ${BACKTEST_MIN}. The entire 2023 tape is reserved for training.`);
       return;
     }
-    const bars = MARKET_DATA.filter(
+    const bars = marketData.filter(
       (bar) => bar.date >= draftStart && bar.date <= draftEnd,
     );
     const count = new Set(bars.map((bar) => bar.date)).size;
@@ -3014,7 +3077,7 @@ export default function Home() {
   const resetPaper = () => {
     setPaper(createInitialPaper(preferences.paperStartingCash));
     setPaperBarIndex(0);
-    setPaperPrice(PAPER_STREAM[0]?.open ?? MARKET_DATA[MARKET_DATA.length - 1].close);
+    setPaperPrice(paperStream[0]?.open ?? marketData[marketData.length - 1].close);
     setPaperActive(false);
     setReplayMode(false);
     setToast(`Paper account reset to ${money(preferences.paperStartingCash)}`);
@@ -3031,7 +3094,7 @@ export default function Home() {
     setCapitalDraft(String(nextCapital));
     setPaper(createInitialPaper(nextCapital));
     setPaperBarIndex(0);
-    setPaperPrice(PAPER_STREAM[0]?.open ?? MARKET_DATA[MARKET_DATA.length - 1].close);
+    setPaperPrice(paperStream[0]?.open ?? marketData[marketData.length - 1].close);
     setPaperActive(false);
     setReplayMode(false);
     setToast(`Sandbox balance set to ${money(nextCapital)} / portfolio reset`);
@@ -3308,7 +3371,7 @@ export default function Home() {
             <div className="instrument-copy">
               <div className="instrument-labels">
                 <span>AAPL</span>
-                <small>NASDAQ / SIMULATED DATA</small>
+                <small>NASDAQ / {marketDataStatus === "live" ? "LIVE MARKET DATA" : "SIMULATED FALLBACK"}</small>
               </div>
               <div className="instrument-price">
                 <h1>Apple Inc.</h1>
@@ -3318,7 +3381,7 @@ export default function Home() {
                   {percent(dayMove, 2)}
                 </span>
               </div>
-              <p>Five-minute multi-strategy ensemble / trend, momentum, reversion, breakouts / flat by 4:00 PM</p>
+              <p>Five-minute multi-strategy ensemble / trend, momentum, reversion, breakouts / {marketDataStatus === "live" ? `AAPL feed through ${latest.date}` : "waiting for live AAPL feed"}</p>
             </div>
           </div>
 
@@ -3343,7 +3406,7 @@ export default function Home() {
                   id="start-date"
                   type="date"
                   min={BACKTEST_MIN}
-                  max={DATA_END}
+                  max={dataEnd}
                   value={draftStart}
                   onChange={(event) => setDraftStart(event.target.value)}
                 />
@@ -3355,7 +3418,7 @@ export default function Home() {
                   id="end-date"
                   type="date"
                   min={BACKTEST_MIN}
-                  max={DATA_END}
+                  max={dataEnd}
                   value={draftEnd}
                   onChange={(event) => setDraftEnd(event.target.value)}
                 />
@@ -3437,7 +3500,8 @@ export default function Home() {
 
             {backtestTab === "chart" && <>
             <div className="chart-summary-line">
-              <span><Activity size={14} /> {sessionCount} days / {filteredData.length} intraday candles</span>
+              <span><Activity size={14} /> {marketDataStatus === "live" ? "LIVE AAPL feed" : "Synthetic fallback"} / through {latest.date}</span>
+              <span>{sessionCount} days / {filteredData.length} intraday candles</span>
               <span><TrendingUp size={14} /> {result.longEntries} longs</span>
               <span><TrendingDown size={14} /> {result.shortEntries} shorts</span>
               <span><Target size={14} /> {latestDecision.regime.toLowerCase()} / {latestDecision.confluence} confirmations</span>
@@ -3734,10 +3798,10 @@ export default function Home() {
                   </button>
                   {!marketClock.isOpen && (
                     <button className={replayMode ? "secondary-button active" : "secondary-button"} type="button" onClick={() => {
-                      if (!replayMode && paperBarIndex >= PAPER_STREAM.length) {
+                      if (!replayMode && paperBarIndex >= paperStream.length) {
                         setPaper(createInitialPaper(preferences.paperStartingCash));
                         setPaperBarIndex(0);
-                        setPaperPrice(PAPER_STREAM[0]?.open ?? paperPrice);
+                        setPaperPrice(paperStream[0]?.open ?? paperPrice);
                       }
                       setReplayMode((active) => !active);
                       setPaperActive(true);
@@ -3749,7 +3813,7 @@ export default function Home() {
                 </div>
                 <div className="automation-rules">
                   <div><span>Decision interval</span><strong>Every five-minute candle</strong></div>
-                  <div><span>Replay progress</span><strong>{Math.min(paperBarIndex, PAPER_STREAM.length)} / {PAPER_STREAM.length} candles</strong></div>
+                  <div><span>Replay progress</span><strong>{Math.min(paperBarIndex, paperStream.length)} / {paperStream.length} candles</strong></div>
                   <div><span>Position policy</span><strong>4 engines / up to {MAX_ENTRIES_PER_SESSION} entries</strong></div>
                   <div><span>Risk exits</span><strong>0.5% ceiling / ATR stop / 1.15–1.85R</strong></div>
                   <div><span>After a stopped trade</span><strong>One-bar reset, then resumes</strong></div>
