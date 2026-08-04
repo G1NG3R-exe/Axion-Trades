@@ -816,7 +816,39 @@ function enrichMarketData(raw: RawMarketBar[]): MarketBar[] {
   });
 }
 
-const STATIC_MARKET_DATA = generateMarketData();
+function generateBootstrapMarketData() {
+  return enrichMarketData([
+    {
+      date: DATA_END,
+      time: "15:50",
+      timestamp: `${DATA_END}-15:50`,
+      barInSession: 76,
+      open: 73.84,
+      high: 73.91,
+      low: 73.79,
+      close: 73.88,
+      volume: 420_000,
+    },
+    {
+      date: DATA_END,
+      time: "15:55",
+      timestamp: `${DATA_END}-15:55`,
+      barInSession: 77,
+      open: 73.88,
+      high: 73.95,
+      low: 73.82,
+      close: 73.91,
+      volume: 460_000,
+    },
+  ]);
+}
+
+// Cloudflare Workers must render the route within a tight CPU budget. The
+// browser generates the full research tape after hydration and then merges the
+// current live feed, so SSR only needs a valid lightweight bootstrap state.
+const STATIC_MARKET_DATA = typeof window === "undefined"
+  ? generateBootstrapMarketData()
+  : generateMarketData();
 const TRAINING_DATA = STATIC_MARKET_DATA.filter(
   (bar) => bar.date >= TRAINING_START && bar.date <= TRAINING_END,
 );
