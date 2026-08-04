@@ -23,8 +23,12 @@ function numberAt(values: Array<number | null> | undefined, index: number) {
 
 export const dynamic = "force-dynamic";
 
+const ALLOWED_RANGES = new Set(["5d", "60d"]);
+
 export async function GET(request: Request) {
   const symbol = new URL(request.url).searchParams.get("symbol")?.toUpperCase() || "AAPL";
+  const requestedRange = new URL(request.url).searchParams.get("range") || "5d";
+  const range = ALLOWED_RANGES.has(requestedRange) ? requestedRange : "5d";
   if (!/^[A-Z.-]{1,12}$/.test(symbol)) {
     return Response.json({ error: "Unsupported symbol" }, { status: 400 });
   }
@@ -32,7 +36,7 @@ export async function GET(request: Request) {
   const upstreamUrl = new URL(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}`);
   upstreamUrl.search = new URLSearchParams({
     interval: "5m",
-    range: "5d",
+    range,
     includePrePost: "false",
     events: "div,splits",
   }).toString();
@@ -75,7 +79,7 @@ export async function GET(request: Request) {
       const volume = numberAt(quote?.volume, index);
       if (
         !open || !high || !low || !close || volume === null ||
-        minutesFromOpen < 0 || minutesFromOpen > 390 || minutesFromOpen % 5 !== 0
+        minutesFromOpen < 0 || minutesFromOpen >= 390 || minutesFromOpen % 5 !== 0
       ) return [];
       const barInSession = minutesFromOpen / 5;
       return [{

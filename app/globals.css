@@ -4004,6 +4004,7 @@ tbody tr:hover {
   padding-top: 17px;
 }
 
+
 @media (max-width: 1120px) {
   .command-center {
     grid-template-columns: minmax(280px, 1fr) minmax(400px, 1.2fr);

@@ -281,11 +281,8 @@ type PersistedLabState = {
 const STARTING_CAPITAL = 10_000;
 const PAPER_STARTING_CASH = 25_000;
 const TRAINING_START = "2023-01-02";
-const TRAINING_END = "2024-12-31";
-const VALIDATION_START = "2025-01-02";
-const VALIDATION_END = "2026-07-29";
 const DATA_START = TRAINING_START;
-const DATA_END = "2026-07-29";
+const DATA_END = "2026-08-03";
 const BACKTEST_MIN = "2025-01-02";
 const DEFAULT_START = BACKTEST_MIN;
 const LEGACY_DEFAULT_END = "2025-12-31";
@@ -306,7 +303,7 @@ const FINRA_TAF_MAX = 9.79;
 const CAT_FEE_PER_SHARE = 0.000003;
 
 const INITIAL_MODEL: ModelWeights = {
-  // Shrunk toward the best isolated 2023-2024 validation checkpoint to reduce search overfit.
+  // Conservative starting checkpoint; new epochs are judged on the live AAPL holdout.
   trend: 0.07168061222484356,
   rsi: 0.04368061222484357,
   momentum: 0.10347403922806399,
@@ -823,59 +820,35 @@ function generateBootstrapMarketData() {
       time: "15:50",
       timestamp: `${DATA_END}-15:50`,
       barInSession: 76,
-      open: 73.84,
-      high: 73.91,
-      low: 73.79,
-      close: 73.88,
-      volume: 420_000,
+      open: 304,
+      high: 304.5,
+      low: 303,
+      close: 303.4010009765625,
+      volume: 2_344_410,
     },
     {
       date: DATA_END,
       time: "15:55",
       timestamp: `${DATA_END}-15:55`,
       barInSession: 77,
-      open: 73.88,
-      high: 73.95,
-      low: 73.82,
-      close: 73.91,
-      volume: 460_000,
+      open: 303.3999938964844,
+      high: 303.489990234375,
+      low: 302.67999267578125,
+      close: 303.2699890136719,
+      volume: 4_523_603,
     },
   ]);
 }
 
 // Cloudflare Workers must render the route within a tight CPU budget. The
-// browser generates the full research tape after hydration and then merges the
-// current live feed, so SSR only needs a valid lightweight bootstrap state.
+// browser replaces this lightweight SSR bootstrap with the actual AAPL feed
+// immediately after hydration, before training, backtesting, or paper replay.
 const STATIC_MARKET_DATA = typeof window === "undefined"
   ? generateBootstrapMarketData()
-  : generateMarketData();
-const TRAINING_DATA = STATIC_MARKET_DATA.filter(
-  (bar) => bar.date >= TRAINING_START && bar.date <= TRAINING_END,
-);
-const VALIDATION_DATA = STATIC_MARKET_DATA.filter(
-  (bar) => bar.date >= VALIDATION_START && bar.date <= VALIDATION_END,
-);
-
-function toRawMarketBar(bar: MarketBar): RawMarketBar {
-  return {
-    date: bar.date,
-    time: bar.time,
-    timestamp: bar.timestamp,
-    barInSession: bar.barInSession,
-    open: bar.open,
-    high: bar.high,
-    low: bar.low,
-    close: bar.close,
-    volume: bar.volume,
-  };
-}
+  : generateBootstrapMarketData();
 
 function mergeLiveMarketData(liveBars: RawMarketBar[]): MarketBar[] {
-  const bars = new Map<string, RawMarketBar>(
-    STATIC_MARKET_DATA.map((bar) => [bar.timestamp, toRawMarketBar(bar)]),
-  );
-  for (const bar of liveBars) bars.set(bar.timestamp, bar);
-  return enrichMarketData([...bars.values()].sort((a, b) => a.timestamp.localeCompare(b.timestamp)));
+  return enrichMarketData([...liveBars].sort((a, b) => a.timestamp.localeCompare(b.timestamp)));
 }
 
 function scoreBarCore(bar: MarketBar, weights: ModelWeights, explain = true) {
@@ -1954,14 +1927,14 @@ function evaluateModel(data: MarketBar[], weights: ModelWeights, externalValidat
   const { trainingData, validationData } = splitForTraining(data);
   const trainingResult = runBacktest(trainingData, weights, STARTING_CAPITAL, false);
   const validationResult = runBacktest(
-    externalValidationData && externalValidationData.length >= BARS_PER_SESSION * 20
+    externalValidationData && externalValidationData.length >= BARS_PER_SESSION * 5
       ? externalValidationData
       : validationData,
     weights,
     STARTING_CAPITAL,
     false,
   );
-  const evaluationData = externalValidationData && externalValidationData.length >= BARS_PER_SESSION * 20
+  const evaluationData = externalValidationData && externalValidationData.length >= BARS_PER_SESSION * 5
     ? externalValidationData
     : validationData;
   const agreement = teacherAgreement(trainingData, weights);
@@ -2976,9 +2949,12 @@ export default function Home() {
   );
   const result = useMemo(() => runBacktest(filteredData, model), [filteredData, model]);
   const sessionCount = useMemo(() => new Set(filteredData.map((bar) => bar.date)).size, [filteredData]);
+  const trainingSplit = useMemo(() => splitForTraining(marketData), [marketData]);
+  const trainingData = trainingSplit.trainingData;
+  const validationData = trainingSplit.validationData;
   const trainingEvaluation = useMemo(
-    () => (TRAINING_DATA.length >= BARS_PER_SESSION * 30 ? evaluateModel(TRAINING_DATA, model, VALIDATION_DATA) : null),
-    [model],
+    () => (trainingData.length >= BARS_PER_SESSION * 10 ? evaluateModel(trainingData, model, validationData) : null),
+    [model, trainingData, validationData],
   );
   const latest = filteredData[filteredData.length - 1] ?? marketData[marketData.length - 1];
   const previous = filteredData[filteredData.length - 2] ?? latest;
@@ -2997,9 +2973,8 @@ export default function Home() {
         : 0;
   const validationResult = trainingEvaluation?.validationResult ?? result;
   const currentTeacherAgreement = trainingEvaluation?.agreement ?? 0;
-  const trainingSplit = useMemo(() => splitForTraining(TRAINING_DATA), []);
   const trainingSplitCount = trainingSplit.trainingData.length;
-  const trainingSessionCount = useMemo(() => new Set(TRAINING_DATA.map((bar) => bar.date)).size, []);
+  const trainingSessionCount = useMemo(() => new Set(trainingData.map((bar) => bar.date)).size, [trainingData]);
 
   useEffect(() => {
     const immediate = window.setTimeout(() => setClock(new Date()), 0);
@@ -3023,7 +2998,7 @@ export default function Home() {
     let cancelled = false;
     const syncMarketData = async () => {
       try {
-        const response = await fetch("/api/market-data?symbol=AAPL", { cache: "no-store" });
+        const response = await fetch("/api/market-data?symbol=AAPL&range=60d", { cache: "no-store" });
         const body = await response.json() as { bars?: RawMarketBar[]; error?: string };
         if (!response.ok || !Array.isArray(body.bars) || !body.bars.length) {
           throw new Error(body.error || "Live market data unavailable");
@@ -3036,10 +3011,14 @@ export default function Home() {
         setMarketData(nextMarketData);
         setMarketDataStatus("live");
         setDataEnd(latestDate);
+        const firstDate = nextMarketData[0]?.date ?? latestDate;
+        setDraftStart((current) => !rangeCustomized && current < firstDate ? firstDate : current);
         setDraftEnd((current) => current === DEFAULT_END || current === LEGACY_DEFAULT_END ? latestDate : current);
-        setRange((current) => current.end === DEFAULT_END || current.end === LEGACY_DEFAULT_END
-          ? { ...current, end: latestDate }
-          : current);
+        setRange((current) => !rangeCustomized && current.start < firstDate
+          ? { start: firstDate, end: latestDate }
+          : current.end === DEFAULT_END || current.end === LEGACY_DEFAULT_END
+            ? { ...current, end: latestDate }
+            : current);
         setPaperPrice((current) => nextPaperStream[0]?.open ?? current);
       } catch {
         if (!cancelled) setMarketDataStatus("fallback");
@@ -3047,7 +3026,18 @@ export default function Home() {
     };
     void syncMarketData();
     return () => { cancelled = true; };
-  }, []);
+  }, [rangeCustomized]);
+
+  useEffect(() => {
+    if (!hydrated || marketDataStatus !== "live") return;
+    const firstDate = marketData[0]?.date;
+    if (!firstDate) return;
+    const timer = window.setTimeout(() => {
+      setDraftStart((current) => current < firstDate ? firstDate : current);
+      setRange((current) => current.start < firstDate ? { ...current, start: firstDate } : current);
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [hydrated, marketData, marketDataStatus]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -3337,8 +3327,9 @@ export default function Home() {
       setRangeError("Choose an end date after the start date.");
       return;
     }
-    if (draftStart < BACKTEST_MIN) {
-      setRangeError(`Backtests begin ${BACKTEST_MIN}. The entire 2023 tape is reserved for training.`);
+    const availableStart = marketData[0]?.date ?? BACKTEST_MIN;
+    if (draftStart < availableStart) {
+      setRangeError(`Actual AAPL history currently begins ${availableStart}.`);
       return;
     }
     const bars = marketData.filter(
@@ -3363,8 +3354,8 @@ export default function Home() {
 
   const trainModel = useCallback(async () => {
     if (training) return;
-    if (TRAINING_DATA.length < BARS_PER_SESSION * 30) {
-      setToast("The isolated 2023-2024 training tape is unavailable");
+    if (trainingData.length < BARS_PER_SESSION * 10) {
+      setToast("Actual AAPL 5-minute history is still loading");
       return;
     }
 
@@ -3373,14 +3364,13 @@ export default function Home() {
     setTrainingProgress(0);
     const trainingStartedAt = Date.now();
     const startingEpoch = trainingEpoch;
-    const { trainingData } = splitForTraining(TRAINING_DATA);
     let bestModel = { ...model };
-    const baseline = evaluateModel(TRAINING_DATA, bestModel, VALIDATION_DATA);
+    const baseline = evaluateModel(trainingData, bestModel, validationData);
     let bestEvaluation = baseline;
     let bestObjective = baseline.objective;
 
     const teacherSeed = teacherSeedModel(trainingData, model);
-    const teacherSeedEvaluation = evaluateModel(TRAINING_DATA, teacherSeed, VALIDATION_DATA);
+    const teacherSeedEvaluation = evaluateModel(trainingData, teacherSeed, validationData);
     if (teacherSeedEvaluation.objective > bestObjective) {
       bestModel = teacherSeed;
       bestEvaluation = teacherSeedEvaluation;
@@ -3436,7 +3426,7 @@ export default function Home() {
           threshold: raw.threshold,
           ensemble: raw.ensemble,
         };
-        const candidateEvaluation = evaluateModel(TRAINING_DATA, candidate, VALIDATION_DATA);
+        const candidateEvaluation = evaluateModel(trainingData, candidate, validationData);
         if (candidateEvaluation.objective > bestObjective) {
           bestObjective = candidateEvaluation.objective;
           bestModel = candidate;
@@ -3470,7 +3460,10 @@ export default function Home() {
       {
         id: `run-${Date.now()}`,
         completedAt: new Date().toISOString(),
-        range: { start: TRAINING_START, end: TRAINING_END },
+        range: {
+          start: trainingData[0]?.date ?? "",
+          end: trainingData[trainingData.length - 1]?.date ?? "",
+        },
         epochs: epochsCompleted,
         improved,
         validationReturn: bestEvaluation.validationResult.strategyReturn,
@@ -3490,7 +3483,7 @@ export default function Home() {
         ? `Checkpoint saved / ${percent(bestEvaluation.validationResult.alpha)} holdout alpha`
         : "Training complete / current checkpoint remains stronger",
     );
-  }, [model, training, trainingEpoch]);
+  }, [model, training, trainingData, trainingEpoch, validationData]);
 
   const resetPaper = () => {
     setPaper(createInitialPaper(preferences.paperStartingCash));
@@ -3691,7 +3684,7 @@ export default function Home() {
           <div className="mode-heading"><span className="view-kicker">CHOOSE AN ENVIRONMENT</span><h1>Where do you want to work?</h1><p>Mode is selected fresh on every visit. Your account data stays attached to your account.</p></div>
           <div className="mode-grid">
             <button className="mode-card sandbox" type="button" onClick={() => setWorkspaceMode("sandbox")}>
-              <span className="mode-card-icon"><FlaskConical size={23} /></span><small>READY</small><h2>Sandbox</h2><p>Train on isolated 2023-2024 data, backtest 2025 onward, and replay five-minute paper trading with fake money.</p><strong>Enter sandbox <ArrowUpRight size={15} /></strong>
+              <span className="mode-card-icon"><FlaskConical size={23} /></span><small>READY</small><h2>Sandbox</h2><p>Train on actual AAPL 5-minute history, backtest the available window, and replay paper trading with simulated money.</p><strong>Enter sandbox <ArrowUpRight size={15} /></strong>
             </button>
             <button className="mode-card live" type="button" onClick={() => setWorkspaceMode("live")}>
               <span className="mode-card-icon"><Radio size={23} /></span><small>EMPTY</small><h2>Live</h2><p>A clean broker workspace with no connection, market feed, positions, orders, or real-money controls.</p><strong>Open empty live mode <ArrowUpRight size={15} /></strong>
@@ -3816,7 +3809,7 @@ export default function Home() {
           <div className="range-builder">
             <div className="range-builder-title">
               <span><CalendarRange size={17} /></span>
-              <div><strong>Replay unseen years</strong><small>2025 onward / held out from training</small></div>
+              <div><strong>Replay actual AAPL window</strong><small>{marketDataStatus === "live" ? `${marketData[0]?.date ?? ""} to ${dataEnd} / real 5-minute bars` : "Waiting for the real AAPL feed"}</small></div>
             </div>
             <div className="range-fields">
               <label htmlFor="start-date">
@@ -3824,7 +3817,7 @@ export default function Home() {
                 <input
                   id="start-date"
                   type="date"
-                  min={BACKTEST_MIN}
+                  min={marketData[0]?.date ?? BACKTEST_MIN}
                   max={dataEnd}
                   value={draftStart}
                   onChange={(event) => setDraftStart(event.target.value)}
@@ -3836,7 +3829,7 @@ export default function Home() {
                 <input
                   id="end-date"
                   type="date"
-                  min={BACKTEST_MIN}
+                  min={marketData[0]?.date ?? BACKTEST_MIN}
                   max={dataEnd}
                   value={draftEnd}
                   onChange={(event) => setDraftEnd(event.target.value)}
@@ -3919,7 +3912,7 @@ export default function Home() {
 
             {backtestTab === "chart" && <>
             <div className="chart-summary-line">
-              <span><Activity size={14} /> {marketDataStatus === "live" ? "LIVE AAPL feed" : "Synthetic fallback"} / through {latest.date}</span>
+              <span><Activity size={14} /> {marketDataStatus === "live" ? "LIVE AAPL feed" : "AAPL feed loading"} / through {latest.date}</span>
               <span>{sessionCount} days / {filteredData.length} intraday candles</span>
               <span><TrendingUp size={14} /> {result.longEntries} longs</span>
               <span><TrendingDown size={14} /> {result.shortEntries} shorts</span>
@@ -4022,7 +4015,7 @@ export default function Home() {
                   <div>
                     <span className="view-kicker">LEARNING LOOP</span>
                     <h2>Teacher-guided, judged out of sample</h2>
-    <p>Only 2023-2024 can train the policy. Candidate checkpoints are judged on the separate 2025-2026 tape before they can replace the current model.</p>
+    <p>Actual AAPL 5-minute candles are split by whole trading days: earlier days train the policy and later days are held out for checkpoint selection.</p>
                   </div>
                   <span className={validationResult.alpha > 0 ? "training-status success" : "training-status"}>
                     {validationResult.alpha > 0 ? <Check size={14} /> : <Target size={14} />}
@@ -4113,7 +4106,7 @@ export default function Home() {
                     <div>
                       <span className="view-kicker">HINDSIGHT TEACHER</span>
                       <h3>Shows the best direction after the fact</h3>
-                      <p>For each 2023-2024 candle, the teacher compares the best long and short excursion over the next four five-minute candles. Those future-aware labels guide training only.</p>
+                      <p>For each actual AAPL candle, the teacher compares the best long and short excursion over the next four five-minute candles. Those future-aware labels guide training only.</p>
                     </div>
                     <div className="teacher-score">
                       <span>Policy agreement</span>
@@ -4124,13 +4117,13 @@ export default function Home() {
                   <article className="split-card">
                     <div className="split-card-heading">
                       <div><BookOpenCheck size={17} /><span>Walk-forward split</span></div>
-                      <small>{trainingSessionCount} days / {TRAINING_DATA.length} candles / 2023-2024 only</small>
+                      <small>{trainingSessionCount} days / {trainingData.length} candles / actual AAPL 5-minute history</small>
                     </div>
                     <div className="split-rail" aria-label="Training and holdout split">
-                      <span style={{ width: `${TRAINING_DATA.length ? trainingSplitCount / TRAINING_DATA.length * 100 : 72}%` }}>Teacher training</span>
+                      <span style={{ width: `${trainingData.length ? trainingSplitCount / trainingData.length * 100 : 72}%` }}>Teacher training</span>
                       <span>Unseen holdout</span>
                     </div>
-                    <p>The teacher split is made on whole trading days with no overlapping candles. Checkpoint selection also runs against the separate 2025–2026 validation tape.</p>
+                    <p>The provider currently exposes a rolling 60-day 5-minute window. The split is made on whole actual trading days with no overlapping candles, and checkpoint selection runs on the later holdout days.</p>
                   </article>
                 </div>}
 
@@ -4465,9 +4458,9 @@ export default function Home() {
             <div className="guide-grid">
               <article>
                 <span className="guide-number">01</span>
-                <h3>Separate years prevent leakage</h3>
-                <p><b>Training is fixed to Jan 2023–Dec 2024.</b> New epochs calibrate seven independent voters, then are accepted only when returns, drawdown, decision quality, and confidence calibration improve on the separate 2025–2026 tape. The date picker begins in 2025, so a backtest candle cannot become a training example.</p>
-                <div className="guide-boundary"><span>2023-2024</span><strong>Train + validate</strong><i /><span>2025-2026</span><strong>Backtest only</strong></div>
+                <h3>Actual data, clean holdout</h3>
+                <p className="actual-training-copy"><b>Training uses actual AAPL data.</b> The browser requests the provider&apos;s rolling 60-day 5-minute history, enriches it with causal indicators, then splits whole trading days into teacher-training and unseen holdout windows. No generated price tape is used after the live history loads.</p>
+                <div className="guide-boundary"><span>Actual AAPL</span><strong>Teacher train</strong><i /><span>Actual AAPL</span><strong>Holdout</strong></div>
               </article>
 
               <article>
@@ -4525,7 +4518,7 @@ export default function Home() {
 
         <footer className="app-footer refined-footer">
           <div><ShieldCheck size={14} /> Research sandbox only. Never fund it with borrowed or family money.</div>
-          <span>Synthetic regime tape—not historical AAPL returns / saved checkpoints and portfolio</span>
+          <span>Actual AAPL 5-minute feed / simulated fills / saved checkpoints and portfolio</span>
         </footer>
       </div>
 
