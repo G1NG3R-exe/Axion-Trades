@@ -1,4 +1,4 @@
-const DEFAULT_SITES_BACKEND = "https://axion-trades-aapl-lab.alexshmulevich424.chatgpt.site";
+const DEFAULT_SITES_BACKEND = "https://axion-trades.alexshmulevich1.workers.dev";
 
 export function usesSitesProxy() {
   return process.env.VERCEL === "1";
@@ -37,7 +37,8 @@ export async function proxySitesRequest(request: Request) {
 
   const token = process.env.AXION_TRADES_SITES_TOKEN;
   if (!token) {
-    return noStoreJson({ error: "The account bridge is not configured." }, 503);
+    const backend = process.env.AXION_TRADES_BACKEND_URL ?? DEFAULT_SITES_BACKEND;
+    if (!backend.includes("workers.dev")) return noStoreJson({ error: "The account bridge is not configured." }, 503);
   }
 
   const incomingUrl = new URL(request.url);
@@ -48,7 +49,7 @@ export async function proxySitesRequest(request: Request) {
     const value = request.headers.get(name);
     if (value) headers.set(name, value);
   }
-  headers.set("OAI-Sites-Authorization", `Bearer ${token}`);
+  if (token) headers.set("OAI-Sites-Authorization", `Bearer ${token}`);
 
   try {
     const upstream = await fetch(target, {

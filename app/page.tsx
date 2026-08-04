@@ -95,6 +95,10 @@ type MarketBar = {
   bodyStrength: number;
   obv: number;
   obvSlope: number;
+  volumeProfilePoc: number;
+  volumeProfileValueHigh: number;
+  volumeProfileValueLow: number;
+  volumeProfileBias: number;
 };
 
 type RawMarketBar = Pick<
@@ -114,11 +118,25 @@ type ModelWeights = {
   squeeze: number;
   levels: number;
   pattern: number;
+  volumeProfile: number;
   threshold: number;
+  ensemble?: EnsembleCalibration;
+};
+
+type ConfidenceBand = "WAIT" | "TACTICAL" | "CONFIRMED" | "CONVICTION";
+type EnsembleDirection = "LONG" | "SHORT" | "FLAT";
+type EnsembleCalibration = {
+  voterSpread: number;
+  consensus: number;
+  tacticalConfidence: number;
+  confirmedConfidence: number;
+  convictionConfidence: number;
+  confidenceBias: number;
 };
 
 type Position = "LONG" | "SHORT" | "FLAT";
 type TradeSide = "BUY" | "SELL" | "SHORT" | "COVER";
+type PolicySignal = "BUY" | "SELL" | "HOLD" | "SHORT";
 type WorkspaceMode = "sandbox" | "live" | null;
 type ActiveView = "chart" | "train" | "paper" | "guide" | "settings" | "account";
 type LaunchView = "chart" | "train" | "paper";
@@ -143,6 +161,7 @@ type PendingEntry = {
   side: "LONG" | "SHORT";
   setup: string;
   confidence: number;
+  confidenceBand: ConfidenceBand;
   stopAtr: number;
   rewardRisk: number;
   maxHoldBars: number;
@@ -182,7 +201,7 @@ type BacktestResult = {
   equity: number[];
   buyHoldEquity: number[];
   scores: number[];
-  signal: "BUY" | "HOLD" | "SHORT";
+  signal: PolicySignal;
   confidence: number;
   longEntries: number;
   shortEntries: number;
@@ -242,11 +261,13 @@ type TrainingRun = {
   validationAlpha: number;
   validationDrawdown: number;
   teacherAgreement: number;
+  decisionQuality: number;
+  calibrationScore: number;
   objectiveDelta: number;
 };
 
 type PersistedLabState = {
-  version: 7;
+  version: 8;
   theme: "light" | "dark";
   model: ModelWeights;
   trainingEpoch: number;
@@ -260,19 +281,22 @@ type PersistedLabState = {
 const STARTING_CAPITAL = 10_000;
 const PAPER_STARTING_CASH = 25_000;
 const TRAINING_START = "2023-01-02";
-const TRAINING_END = "2023-12-29";
+const TRAINING_END = "2024-12-31";
+const VALIDATION_START = "2025-01-02";
+const VALIDATION_END = "2026-07-29";
 const DATA_START = TRAINING_START;
 const DATA_END = "2026-07-29";
-const BACKTEST_MIN = "2024-01-02";
-const DEFAULT_START = "2024-01-02";
+const BACKTEST_MIN = "2025-01-02";
+const DEFAULT_START = BACKTEST_MIN;
+const LEGACY_DEFAULT_END = "2025-12-31";
 const DEFAULT_END = DATA_END;
-const STATE_VERSION = 7;
-const MODEL_STATE_VERSION = 6;
+const STATE_VERSION = 8;
+const MODEL_STATE_VERSION = 8;
 const BAR_MINUTES = 5;
 const BARS_PER_SESSION = 78;
 const OPENING_RANGE_BARS = 3;
-const LAST_ENTRY_BAR = 72;
-const MAX_ENTRIES_PER_SESSION = 14;
+const LAST_ENTRY_BAR = 74;
+const MAX_ENTRIES_PER_SESSION = 22;
 const RISK_PER_TRADE_FRACTION = 0.005;
 const DAILY_LOSS_LIMIT_FRACTION = 0.02;
 const LOSS_COOLDOWN_BARS = 1;
@@ -282,19 +306,28 @@ const FINRA_TAF_MAX = 9.79;
 const CAT_FEE_PER_SHARE = 0.000003;
 
 const INITIAL_MODEL: ModelWeights = {
-  // Shrunk 60% toward the best isolated-2023 validation checkpoint to reduce search overfit.
+  // Shrunk toward the best isolated 2023-2024 validation checkpoint to reduce search overfit.
   trend: 0.07168061222484356,
   rsi: 0.04368061222484357,
   momentum: 0.10347403922806399,
   volatility: 0.14242461163470482,
   vwap: 0.07540162858738356,
-  volume: 0.09629939527566583,
+  volume: 0.04629939527566583,
   orb: 0.14922675137115206,
   pullback: 0.05380814946210659,
   squeeze: 0.03276045916863267,
   levels: 0.09181760420301565,
   pattern: 0.13942613661958776,
+  volumeProfile: 0.05,
   threshold: 0.20138767231814566,
+  ensemble: {
+    voterSpread: 0.2,
+    consensus: 0.58,
+    tacticalConfidence: 60,
+    confirmedConfidence: 72,
+    convictionConfidence: 84,
+    confidenceBias: 0,
+  },
 };
 
 const INITIAL_PROFILE: UserProfile = {
@@ -453,6 +486,10 @@ function generateMarketData(): MarketBar[] {
     | "bodyStrength"
     | "obv"
     | "obvSlope"
+    | "volumeProfilePoc"
+    | "volumeProfileValueHigh"
+    | "volumeProfileValueLow"
+    | "volumeProfileBias"
   >[] = [];
   const cursor = new Date(`${DATA_START}T12:00:00Z`);
   const lastDate = new Date(`${DATA_END}T12:00:00Z`);
@@ -682,6 +719,49 @@ function enrichMarketData(raw: RawMarketBar[]): MarketBar[] {
     const rollingWindow = raw.slice(Math.max(0, index - BARS_PER_SESSION), index);
     const rollingHigh = rollingWindow.length ? Math.max(...rollingWindow.map((value) => value.high)) : bar.high;
     const rollingLow = rollingWindow.length ? Math.min(...rollingWindow.map((value) => value.low)) : bar.low;
+    const profileWindow = raw.slice(Math.max(0, index - BARS_PER_SESSION * 20), index);
+    const profileSource = profileWindow.length ? profileWindow : [bar];
+    const profileLow = Math.min(...profileSource.map((value) => value.low));
+    const profileHigh = Math.max(...profileSource.map((value) => value.high));
+    const profileBinWidth = Math.max(0.0001, (profileHigh - profileLow) / 24);
+    const profileVolumes = Array.from({ length: 24 }, () => 0);
+    for (const profileBar of profileSource) {
+      const typicalPrice = (profileBar.high + profileBar.low + profileBar.close) / 3;
+      const profileBin = Math.min(23, Math.max(0, Math.floor((typicalPrice - profileLow) / profileBinWidth)));
+      profileVolumes[profileBin] += profileBar.volume;
+    }
+    const profileTotal = profileVolumes.reduce((sum, value) => sum + value, 0);
+    const pocBin = profileVolumes.reduce(
+      (best, value, profileIndex) => value > profileVolumes[best] ? profileIndex : best,
+      0,
+    );
+    let valueLowBin = pocBin;
+    let valueHighBin = pocBin;
+    let valueVolume = profileVolumes[pocBin];
+    while (valueVolume < profileTotal * 0.7 && (valueLowBin > 0 || valueHighBin < 23)) {
+      const lowerVolume = valueLowBin > 0 ? profileVolumes[valueLowBin - 1] : -1;
+      const higherVolume = valueHighBin < 23 ? profileVolumes[valueHighBin + 1] : -1;
+      if (higherVolume >= lowerVolume && valueHighBin < 23) {
+        valueHighBin += 1;
+        valueVolume += higherVolume;
+      } else if (valueLowBin > 0) {
+        valueLowBin -= 1;
+        valueVolume += lowerVolume;
+      } else {
+        break;
+      }
+    }
+    const volumeProfilePoc = profileLow + (pocBin + 0.5) * profileBinWidth;
+    const volumeProfileValueLow = profileLow + valueLowBin * profileBinWidth;
+    const volumeProfileValueHigh = profileLow + (valueHighBin + 1) * profileBinWidth;
+    const profileScale = Math.max(atr * 1.6, profileBinWidth * 3);
+    const profileDistance = clamp((bar.close - volumeProfilePoc) / profileScale, -1, 1);
+    const outsideValue = bar.close > volumeProfileValueHigh
+      ? clamp((bar.close - volumeProfileValueHigh) / profileScale, 0, 1)
+      : bar.close < volumeProfileValueLow
+        ? -clamp((volumeProfileValueLow - bar.close) / profileScale, 0, 1)
+        : 0;
+    const volumeProfileBias = clamp(profileDistance * 0.42 + outsideValue * 0.58, -1, 1);
     const bandWidth = mean === 0 ? 0 : (deviation * 4) / mean;
     const priorBandWidths = bandWidths.slice(Math.max(0, bandWidths.length - BARS_PER_SESSION));
     const averageBandWidth = priorBandWidths.length
@@ -728,6 +808,10 @@ function enrichMarketData(raw: RawMarketBar[]): MarketBar[] {
       bodyStrength,
       obv,
       obvSlope,
+      volumeProfilePoc,
+      volumeProfileValueHigh,
+      volumeProfileValueLow,
+      volumeProfileBias,
     };
   });
 }
@@ -735,6 +819,9 @@ function enrichMarketData(raw: RawMarketBar[]): MarketBar[] {
 const STATIC_MARKET_DATA = generateMarketData();
 const TRAINING_DATA = STATIC_MARKET_DATA.filter(
   (bar) => bar.date >= TRAINING_START && bar.date <= TRAINING_END,
+);
+const VALIDATION_DATA = STATIC_MARKET_DATA.filter(
+  (bar) => bar.date >= VALIDATION_START && bar.date <= VALIDATION_END,
 );
 
 function toRawMarketBar(bar: MarketBar): RawMarketBar {
@@ -759,7 +846,7 @@ function mergeLiveMarketData(liveBars: RawMarketBar[]): MarketBar[] {
   return enrichMarketData([...bars.values()].sort((a, b) => a.timestamp.localeCompare(b.timestamp)));
 }
 
-function scoreBar(bar: MarketBar, weights: ModelWeights, explain = true) {
+function scoreBarCore(bar: MarketBar, weights: ModelWeights, explain = true) {
   const atrUnit = Math.max(bar.atr, bar.close * 0.0015);
   const emaDirection = clamp((bar.ema9 - bar.ema21) / atrUnit, -1, 1);
   const structuralDirection = clamp((bar.ema21 - bar.ema50) / (atrUnit * 1.45), -1, 1);
@@ -789,8 +876,9 @@ function scoreBar(bar: MarketBar, weights: ModelWeights, explain = true) {
     1,
   );
   const vwap = clamp((bar.close - bar.vwap) / (atrUnit * 1.15), -1, 1);
+  const volumeProfile = bar.volumeProfileBias;
   const volume = clamp(
-    bar.obvSlope * 0.58 + bar.bodyStrength * Math.max(0, bar.volumeRatio - 0.62) * 0.42,
+    bar.obvSlope * 0.46 + bar.bodyStrength * Math.max(0, bar.volumeRatio - 0.62) * 0.34 + volumeProfile * 0.2,
     -1,
     1,
   );
@@ -860,12 +948,12 @@ function scoreBar(bar: MarketBar, weights: ModelWeights, explain = true) {
   const upperBandRejection = bar.high >= bar.upperBand * 0.999 && bar.closeLocation < -0.18;
   const rejection = lowerBandRejection ? 0.24 : upperBandRejection ? -0.24 : pattern * 0.07;
   const meanReversion = clamp(
-    -bandStretch * 0.36 - vwapStretch * 0.22 + rsiReversion * 0.25 + rejection,
+    -bandStretch * 0.31 - vwapStretch * 0.2 + rsiReversion * 0.23 + rejection - volumeProfile * 0.08,
     -1,
     1,
   );
   const breakout = clamp(
-    orb * 0.36 + levelBreakout * 0.26 + squeeze * 0.2 + volume * 0.18,
+    orb * 0.32 + levelBreakout * 0.24 + squeeze * 0.18 + volume * 0.16 + volumeProfile * 0.1,
     -1,
     1,
   );
@@ -901,6 +989,7 @@ function scoreBar(bar: MarketBar, weights: ModelWeights, explain = true) {
     volatility,
     vwap,
     volume,
+    volumeProfile,
     orb,
     pullback,
     squeeze,
@@ -914,6 +1003,7 @@ function scoreBar(bar: MarketBar, weights: ModelWeights, explain = true) {
     volatility * weights.volatility +
     vwap * weights.vwap +
     volume * weights.volume +
+    volumeProfile * weights.volumeProfile +
     orb * weights.orb +
     pullback * weights.pullback +
     squeeze * weights.squeeze +
@@ -933,6 +1023,7 @@ function scoreBar(bar: MarketBar, weights: ModelWeights, explain = true) {
     momentum,
     vwap,
     volume,
+    volumeProfile,
     orb,
     pullback,
     squeeze,
@@ -959,6 +1050,7 @@ function scoreBar(bar: MarketBar, weights: ModelWeights, explain = true) {
       ["trend", "EMA / ADX trend"],
       ["vwap", "VWAP alignment"],
       ["volume", "Volume confirmation"],
+      ["volumeProfile", "Volume profile acceptance"],
       ["pattern", "Confirmation candle"],
       ["rsi", "RSI regime signal"],
       ["volatility", "Range expansion"],
@@ -980,8 +1072,153 @@ function scoreBar(bar: MarketBar, weights: ModelWeights, explain = true) {
   };
 }
 
+type BaseWeightKey = Exclude<keyof ModelWeights, "ensemble">;
+type EnsembleVoter = {
+  label: string;
+  weight: number;
+  model: ModelWeights;
+};
+
+function ensembleCalibration(weights: ModelWeights): EnsembleCalibration {
+  return weights.ensemble ?? INITIAL_MODEL.ensemble!;
+}
+
+function buildEnsembleVoters(weights: ModelWeights): EnsembleVoter[] {
+  const calibration = ensembleCalibration(weights);
+  const profiles: Array<{
+    label: string;
+    weight: number;
+    thresholdFactor: number;
+    multipliers: Partial<Record<BaseWeightKey, number>>;
+  }> = [
+    {
+      label: "Consensus anchor",
+      weight: 1.8,
+      thresholdFactor: 1,
+      multipliers: {},
+    },
+    {
+      label: "Trend voter",
+      weight: 1.1,
+      thresholdFactor: 0.96,
+      multipliers: { trend: 1.7, vwap: 1.35, pullback: 1.4, momentum: 1.15, pattern: 1.1, rsi: 0.72 },
+    },
+    {
+      label: "Momentum voter",
+      weight: 1.05,
+      thresholdFactor: 0.98,
+      multipliers: { momentum: 1.65, volume: 1.3, squeeze: 1.3, orb: 1.25, pattern: 1.2, rsi: 1.08 },
+    },
+    {
+      label: "Mean-reversion voter",
+      weight: 0.95,
+      thresholdFactor: 1.03,
+      multipliers: { rsi: 1.65, levels: 1.35, volatility: 1.25, pattern: 0.85, trend: 0.72, momentum: 0.78 },
+    },
+    {
+      label: "Volume-profile voter",
+      weight: 1.15,
+      thresholdFactor: 1,
+      multipliers: { volumeProfile: 1.8, volume: 1.4, levels: 1.35, vwap: 1.2, orb: 1.15, volatility: 0.86 },
+    },
+    {
+      label: "Breakout voter",
+      weight: 1,
+      thresholdFactor: 1.01,
+      multipliers: { orb: 1.55, squeeze: 1.55, volume: 1.35, momentum: 1.25, levels: 1.2, rsi: 0.8 },
+    },
+    {
+      label: "Defensive voter",
+      weight: 0.85,
+      thresholdFactor: 1.14,
+      multipliers: { volatility: 1.35, volumeProfile: 1.2, levels: 1.2, trend: 0.9, momentum: 0.82, rsi: 1.15 },
+    },
+  ];
+  const spread = 0.72 + calibration.voterSpread;
+  return profiles.map((profile) => {
+    const adjusted = { ...weights, ensemble: undefined } as ModelWeights;
+    for (const key of Object.keys(profile.multipliers) as BaseWeightKey[]) {
+      if (key === "threshold") continue;
+      const multiplier = profile.multipliers[key] ?? 1;
+      adjusted[key] = weights[key] * (1 + (multiplier - 1) * spread);
+    }
+    adjusted.threshold = clamp(weights.threshold * profile.thresholdFactor, 0.16, 0.3);
+    return {
+      label: profile.label,
+      weight: profile.weight,
+      model: normalizeModel(adjusted),
+    };
+  });
+}
+
+function scoreBar(bar: MarketBar, weights: ModelWeights, explain = true) {
+  const base = scoreBarCore(bar, weights, explain);
+  const calibration = ensembleCalibration(weights);
+  const voters = buildEnsembleVoters(weights);
+  const voterResults = voters.map((voter) => {
+    const scored = scoreBarCore(bar, voter.model, false);
+    const threshold = intradayEntryThreshold(voter.model);
+    const direction: EnsembleDirection = scored.score > threshold
+      ? "LONG"
+      : scored.score < -threshold
+        ? "SHORT"
+        : "FLAT";
+    return { ...voter, scored, direction };
+  });
+  const totalWeight = voterResults.reduce((sum, voter) => sum + voter.weight, 0);
+  const longWeight = voterResults.reduce((sum, voter) => sum + (voter.direction === "LONG" ? voter.weight : 0), 0);
+  const shortWeight = voterResults.reduce((sum, voter) => sum + (voter.direction === "SHORT" ? voter.weight : 0), 0);
+  const flatWeight = Math.max(0, totalWeight - longWeight - shortWeight);
+  const weightedScore = voterResults.reduce((sum, voter) => sum + voter.scored.score * voter.weight, 0) / totalWeight;
+  const consensus = calibration.consensus;
+  const direction: EnsembleDirection = longWeight / totalWeight >= consensus && weightedScore > 0
+    ? "LONG"
+    : shortWeight / totalWeight >= consensus && weightedScore < 0
+      ? "SHORT"
+      : "FLAT";
+  const winningWeight = direction === "LONG" ? longWeight : direction === "SHORT" ? shortWeight : Math.max(longWeight, shortWeight);
+  const majority = winningWeight / totalWeight;
+  const activeWeight = (longWeight + shortWeight) / totalWeight;
+  const confidence = direction === "FLAT"
+    ? Math.round(clamp(50 + Math.abs(longWeight - shortWeight) / totalWeight * 26 + Math.abs(weightedScore) * 16 + activeWeight * 8, 50, 69))
+    : Math.round(clamp(
+      52 + Math.abs(weightedScore) * 14 + Math.max(0, (majority - calibration.consensus) / Math.max(0.05, 1 - calibration.consensus)) * 24 + Math.min(8, base.confluence) * 0.9 + calibration.confidenceBias,
+      50,
+      96,
+    ));
+  const confidenceBand: ConfidenceBand = confidence >= calibration.convictionConfidence
+    ? "CONVICTION"
+    : confidence >= calibration.confirmedConfidence
+      ? "CONFIRMED"
+      : confidence >= calibration.tacticalConfidence
+        ? "TACTICAL"
+        : "WAIT";
+  const voteCount = direction === "LONG"
+    ? voterResults.filter((voter) => voter.direction === "LONG").length
+    : direction === "SHORT"
+      ? voterResults.filter((voter) => voter.direction === "SHORT").length
+      : 0;
+
+  return {
+    ...base,
+    score: clamp(weightedScore * (0.82 + majority * 0.38), -1, 1),
+    direction,
+    action: direction === "LONG" ? "BUY" as const : direction === "SHORT" ? "SHORT" as const : "HOLD" as const,
+    confidence,
+    confidenceBand,
+    voterCount: voters.length,
+    voteCount,
+    longVotes: voterResults.filter((voter) => voter.direction === "LONG").length,
+    shortVotes: voterResults.filter((voter) => voter.direction === "SHORT").length,
+    flatVotes: voterResults.filter((voter) => voter.direction === "FLAT").length,
+    voteSummary: `${voterResults.filter((voter) => voter.direction === "LONG").length} long / ${voterResults.filter((voter) => voter.direction === "SHORT").length} short / ${voterResults.filter((voter) => voter.direction === "FLAT").length} wait`,
+    weightedScore,
+    flatWeight,
+  };
+}
+
 function intradayEntryThreshold(weights: ModelWeights) {
-  return clamp(weights.threshold * 0.68, 0.12, 0.2);
+  return clamp(weights.threshold * 0.6, 0.1, 0.2);
 }
 
 function pendingEntryForBar(
@@ -998,8 +1235,8 @@ function pendingEntryForBar(
   if (
     bar.barInSession < OPENING_RANGE_BARS - 1 ||
     bar.barInSession >= LAST_ENTRY_BAR ||
-    bar.volumeRatio <= 0.48 ||
-    algorithmStrength < 0.2 ||
+    bar.volumeRatio <= 0.38 ||
+    algorithmStrength < 0.12 ||
     scored.confluence < 2 ||
     !(
       Math.abs(scored.factors.orb) >= 0.16 ||
@@ -1015,20 +1252,21 @@ function pendingEntryForBar(
 
   const threshold = intradayEntryThreshold(weights);
   const dynamicThreshold = threshold * (bar.barInSession >= 66 ? 1.08 : bar.barInSession >= 30 && bar.barInSession <= 48 ? 1.03 : 1);
-  const side = scored.score > dynamicThreshold
+  const side = scored.action === "BUY" && scored.confidenceBand !== "WAIT" && scored.score > dynamicThreshold
     ? "LONG"
-    : scored.score < -dynamicThreshold
+    : scored.action === "SHORT" && scored.confidenceBand !== "WAIT" && scored.score < -dynamicThreshold
       ? "SHORT"
       : null;
   if (!side) return null;
   return {
     side,
     setup: scored.setup,
-    confidence: Math.round(clamp(48 + Math.abs(scored.score) * 35 + scored.confluence * 3.2, 50, 98)),
+    confidence: scored.confidence,
+    confidenceBand: scored.confidenceBand,
     stopAtr: scored.stopAtr,
     rewardRisk: scored.rewardRisk,
     maxHoldBars: scored.regime === "TREND" ? 8 : scored.regime === "SQUEEZE" ? 7 : 4,
-    reason: `${scored.algorithm} / ${scored.setup} / ${scored.regime.toLowerCase()} / ${scored.confluence} confirmations`,
+    reason: `${scored.confidenceBand} ensemble / ${scored.voteSummary} / ${scored.algorithm} / ${scored.setup}`,
     signalPrice: bar.close,
     signalAtr: bar.atr,
     signalTimestamp: bar.timestamp,
@@ -1039,10 +1277,17 @@ function pendingEntryForBar(
 
 function entryRiskPlan(signal: PendingEntry, equity: number, referencePrice: number) {
   const stopDistance = Math.max(signal.signalAtr * signal.stopAtr, referencePrice * 0.0012);
-  const allocationFraction = signal.regime === "RANGE" ? 0.9 : signal.regime === "SQUEEZE" ? 0.95 : 0.97;
+  const confidenceScale = signal.confidenceBand === "CONVICTION"
+    ? 1
+    : signal.confidenceBand === "CONFIRMED"
+      ? 0.99
+      : signal.confidenceBand === "TACTICAL"
+        ? 0.72
+        : 0;
+  const allocationFraction = (signal.regime === "RANGE" ? 0.9 : signal.regime === "SQUEEZE" ? 0.95 : 0.97) * confidenceScale;
   return {
     stopDistance,
-    riskBudget: Math.max(0, equity) * RISK_PER_TRADE_FRACTION,
+    riskBudget: Math.max(0, equity) * RISK_PER_TRADE_FRACTION * confidenceScale,
     allocation: Math.max(0, equity) * allocationFraction,
   };
 }
@@ -1116,6 +1361,7 @@ function runBacktest(
   let totalSlippage = 0;
   let spreadTotal = 0;
   let fillCount = 0;
+  let latestSignal: PolicySignal = "HOLD";
   const sessions = new Set<string>();
   const weeklyReturns: number[] = [];
   const trades: Trade[] = [];
@@ -1206,10 +1452,15 @@ function runBacktest(
     const score = scored.score;
     latestScore = score;
     if (collectSeries) scores.push(score);
-    const confidence = Math.round(clamp(48 + Math.abs(score) * 35 + scored.confluence * 3.2, 50, 98));
+    const confidence = scored.confidence;
     const heldBars = entryIndex >= 0 ? index - entryIndex : 0;
     const sessionClose = bar.barInSession === BARS_PER_SESSION - 1;
-    const threshold = intradayEntryThreshold(weights);
+    const positionBeforeExit: Position = shares > 0 ? "LONG" : shares < 0 ? "SHORT" : "FLAT";
+    latestSignal = positionBeforeExit === "LONG"
+      ? scored.direction === "SHORT" && scored.confidenceBand !== "WAIT" ? "SELL" : "HOLD"
+      : positionBeforeExit === "SHORT"
+        ? scored.direction === "LONG" && scored.confidenceBand !== "WAIT" ? "BUY" : "HOLD"
+        : scored.action;
     let exitReason = "";
     let exitReference = 0;
     let exitKind: FillKind = "market";
@@ -1231,7 +1482,7 @@ function runBacktest(
       } else if (heldBars >= maxHoldBars) {
         exitReason = "Time stop";
         exitReference = bar.close;
-      } else if (score < -threshold * 0.72 && scored.confluence >= 3) {
+      } else if (scored.direction === "SHORT" && scored.confidenceBand !== "WAIT" && scored.confluence >= 3) {
         exitReason = "Confluence reversed";
         exitReference = bar.close;
       } else if (heldBars >= 1) {
@@ -1255,7 +1506,7 @@ function runBacktest(
       } else if (heldBars >= maxHoldBars) {
         exitReason = "Time stop";
         exitReference = bar.close;
-      } else if (score > threshold * 0.72 && scored.confluence >= 3) {
+      } else if (scored.direction === "LONG" && scored.confidenceBand !== "WAIT" && scored.confluence >= 3) {
         exitReason = "Confluence reversed";
         exitReference = bar.close;
       } else if (heldBars >= 1) {
@@ -1265,6 +1516,7 @@ function runBacktest(
     }
 
     if (shares > 0 && exitReason) {
+      latestSignal = "SELL";
       const quantity = shares;
       const fill = executionFill(bar, "SELL", exitReference, quantity, exitKind);
       const notional = quantity * fill.price;
@@ -1302,6 +1554,7 @@ function runBacktest(
       entryFees = 0;
       cooldownBars = pnl < 0 ? LOSS_COOLDOWN_BARS : 0;
     } else if (shares < 0 && exitReason) {
+      latestSignal = "BUY";
       const quantity = Math.abs(shares);
       const fill = executionFill(bar, "COVER", exitReference, quantity, exitKind);
       const notional = quantity * fill.price;
@@ -1372,8 +1625,7 @@ function runBacktest(
   }
   const averageWeekReturn = weeklyReturns.reduce((sum, value) => sum + value, 0) / Math.max(1, weeklyReturns.length);
   const positiveWeekRate = weeklyReturns.filter((value) => value > 0).length / Math.max(1, weeklyReturns.length);
-  const entryThreshold = intradayEntryThreshold(weights);
-  const signal = latestScore > entryThreshold ? "BUY" : latestScore < -entryThreshold ? "SHORT" : "HOLD";
+  const signal = latestSignal;
 
   return {
     finalValue,
@@ -1487,7 +1739,6 @@ function advancePaperAccount(
   }
 
   const scored = scoreBar(bar, weights, true);
-  const threshold = intradayEntryThreshold(weights);
   const sessionClose = bar.barInSession === BARS_PER_SESSION - 1;
   const heldBars = next.shares === 0 ? 0 : next.barsHeld;
   let exitReason = "";
@@ -1509,7 +1760,7 @@ function advancePaperAccount(
     } else if (heldBars >= next.maxHoldBars) {
       exitReason = "Time stop";
       exitReference = bar.close;
-    } else if (scored.score < -threshold * 0.72 && scored.confluence >= 3) {
+    } else if (scored.direction === "SHORT" && scored.confidenceBand !== "WAIT" && scored.confluence >= 3) {
       exitReason = "Confluence reversed";
       exitReference = bar.close;
     } else if (heldBars >= 1) {
@@ -1533,7 +1784,7 @@ function advancePaperAccount(
     } else if (heldBars >= next.maxHoldBars) {
       exitReason = "Time stop";
       exitReference = bar.close;
-    } else if (scored.score > threshold * 0.72 && scored.confluence >= 3) {
+    } else if (scored.direction === "LONG" && scored.confidenceBand !== "WAIT" && scored.confluence >= 3) {
       exitReason = "Confluence reversed";
       exitReference = bar.close;
     } else if (heldBars >= 1) {
@@ -1613,11 +1864,7 @@ function oracleAction(data: MarketBar[], index: number): Position {
 }
 
 function policyAction(bar: MarketBar, weights: ModelWeights): Position {
-  const score = scoreBar(bar, weights, false).score;
-  const threshold = intradayEntryThreshold(weights);
-  if (score > threshold) return "LONG";
-  if (score < -threshold) return "SHORT";
-  return "FLAT";
+  return scoreBar(bar, weights, false).direction;
 }
 
 function teacherAgreement(data: MarketBar[], weights: ModelWeights) {
@@ -1636,6 +1883,28 @@ function teacherAgreement(data: MarketBar[], weights: ModelWeights) {
   return recalls.length === 0 ? 0 : recalls.reduce((sum, value) => sum + value, 0) / recalls.length;
 }
 
+function ensembleDecisionMetrics(data: MarketBar[], weights: ModelWeights) {
+  if (data.length < 30) return { decisionQuality: 0, calibrationScore: 0 };
+  let total = 0;
+  let correct = 0;
+  let brierLoss = 0;
+  for (let index = 22; index < data.length - 5; index += 2) {
+    const teacher = oracleAction(data, index);
+    const scored = scoreBar(data[index], weights, false);
+    const isCorrect = scored.direction === teacher;
+    const confidence = scored.direction === "FLAT"
+      ? 1 - clamp((scored.confidence - 50) / 50, 0, 1)
+      : scored.confidence / 100;
+    total += 1;
+    if (isCorrect) correct += 1;
+    brierLoss += (confidence - (isCorrect ? 1 : 0)) ** 2;
+  }
+  return {
+    decisionQuality: total === 0 ? 0 : correct / total,
+    calibrationScore: total === 0 ? 0 : clamp(1 - brierLoss / total, 0, 1),
+  };
+}
+
 function splitForTraining(data: MarketBar[]) {
   const sessions = [...new Set(data.map((bar) => bar.date))];
   const splitSessionIndex = Math.max(
@@ -1649,28 +1918,53 @@ function splitForTraining(data: MarketBar[]) {
   };
 }
 
-function evaluateModel(data: MarketBar[], weights: ModelWeights) {
+function evaluateModel(data: MarketBar[], weights: ModelWeights, externalValidationData?: MarketBar[]) {
   const { trainingData, validationData } = splitForTraining(data);
   const trainingResult = runBacktest(trainingData, weights, STARTING_CAPITAL, false);
-  const validationResult = runBacktest(validationData, weights, STARTING_CAPITAL, false);
+  const validationResult = runBacktest(
+    externalValidationData && externalValidationData.length >= BARS_PER_SESSION * 20
+      ? externalValidationData
+      : validationData,
+    weights,
+    STARTING_CAPITAL,
+    false,
+  );
+  const evaluationData = externalValidationData && externalValidationData.length >= BARS_PER_SESSION * 20
+    ? externalValidationData
+    : validationData;
   const agreement = teacherAgreement(trainingData, weights);
-  const turnoverPenalty = Math.max(0, validationResult.tradesPerDay - 14);
-  const undertradingPenalty = Math.max(0, 6 - validationResult.tradesPerDay);
-  const cadenceReward = Math.min(10, validationResult.tradesPerDay) * 0.0022;
+  const validationAgreement = teacherAgreement(evaluationData, weights);
+  const validationMetrics = ensembleDecisionMetrics(evaluationData, weights);
+  const turnoverPenalty = Math.max(0, validationResult.tradesPerDay - 22);
+  const undertradingPenalty = Math.max(0, 10 - validationResult.tradesPerDay);
+  const cadenceReward = Math.min(18, validationResult.tradesPerDay) * 0.0022;
   const objective =
-    validationResult.strategyReturn * 0.58 +
-    validationResult.alpha * 0.42 +
-    validationResult.averageWeekReturn * 1.4 +
+    validationResult.strategyReturn * 0.72 +
+    validationResult.alpha * 0.58 +
+    validationResult.averageWeekReturn * 1.25 +
     validationResult.positiveWeekRate * 0.025 +
     validationResult.sharpe * 0.012 -
     Math.abs(validationResult.maxDrawdown) * 0.38 +
     trainingResult.strategyReturn * 0.1 +
-    agreement * 0.08 -
+    agreement * 0.08 +
+    validationAgreement * 0.12 +
+    validationMetrics.decisionQuality * 0.12 +
+    validationMetrics.calibrationScore * 0.08 +
+    Math.max(0, 0.5 - validationMetrics.decisionQuality) * -0.8 +
+    Math.max(0, 0.6 - validationMetrics.calibrationScore) * -0.7 +
     turnoverPenalty * 0.012 -
     undertradingPenalty * 0.012 +
     cadenceReward;
 
-  return { objective, agreement, trainingResult, validationResult };
+  return {
+    objective,
+    agreement,
+    validationAgreement,
+    decisionQuality: validationMetrics.decisionQuality,
+    calibrationScore: validationMetrics.calibrationScore,
+    trainingResult,
+    validationResult,
+  };
 }
 
 function teacherSeedModel(data: MarketBar[], current: ModelWeights): ModelWeights {
@@ -1686,6 +1980,7 @@ function teacherSeedModel(data: MarketBar[], current: ModelWeights): ModelWeight
     squeeze: 0,
     levels: 0,
     pattern: 0,
+    volumeProfile: 0,
   };
   let examples = 0;
   for (let index = 22; index < data.length - 5; index += 1) {
@@ -1703,6 +1998,7 @@ function teacherSeedModel(data: MarketBar[], current: ModelWeights): ModelWeight
     totals.squeeze += factors.squeeze * target;
     totals.levels += factors.levels * target;
     totals.pattern += factors.pattern * target;
+    totals.volumeProfile += factors.volumeProfile * target;
     examples += 1;
   }
 
@@ -1719,6 +2015,7 @@ function teacherSeedModel(data: MarketBar[], current: ModelWeights): ModelWeight
     squeeze: Math.max(0.015, totals.squeeze / examples),
     levels: Math.max(0.015, totals.levels / examples),
     pattern: Math.max(0.015, totals.pattern / examples),
+    volumeProfile: Math.max(0.02, totals.volumeProfile / examples),
   };
   const sum = Object.values(learned).reduce((total, value) => total + value, 0);
   const blend = 0.34;
@@ -1734,6 +2031,7 @@ function teacherSeedModel(data: MarketBar[], current: ModelWeights): ModelWeight
     squeeze: current.squeeze * (1 - blend) + (learned.squeeze / sum) * blend,
     levels: current.levels * (1 - blend) + (learned.levels / sum) * blend,
     pattern: current.pattern * (1 - blend) + (learned.pattern / sum) * blend,
+    volumeProfile: current.volumeProfile * (1 - blend) + (learned.volumeProfile / sum) * blend,
     threshold: current.threshold * 0.8 + INITIAL_MODEL.threshold * 0.2,
   });
 }
@@ -2377,6 +2675,7 @@ function finiteNumber(value: unknown, fallback: number) {
 
 function normalizeModel(value: unknown): ModelWeights {
   const model = (value ?? {}) as Partial<ModelWeights>;
+  const savedEnsemble = (model.ensemble ?? {}) as Partial<EnsembleCalibration>;
   const raw = {
     trend: clamp(finiteNumber(model.trend, INITIAL_MODEL.trend), 0.02, 0.85),
     rsi: clamp(finiteNumber(model.rsi, INITIAL_MODEL.rsi), 0.02, 0.65),
@@ -2389,8 +2688,24 @@ function normalizeModel(value: unknown): ModelWeights {
     squeeze: clamp(finiteNumber(model.squeeze, INITIAL_MODEL.squeeze), 0.015, 0.55),
     levels: clamp(finiteNumber(model.levels, INITIAL_MODEL.levels), 0.015, 0.5),
     pattern: clamp(finiteNumber(model.pattern, INITIAL_MODEL.pattern), 0.015, 0.5),
+    volumeProfile: clamp(finiteNumber(model.volumeProfile, INITIAL_MODEL.volumeProfile), 0.02, 0.5),
   };
   const sum = Object.values(raw).reduce((total, item) => total + item, 0);
+  const tacticalConfidence = clamp(
+    finiteNumber(savedEnsemble.tacticalConfidence, INITIAL_MODEL.ensemble?.tacticalConfidence ?? 60),
+    54,
+    72,
+  );
+  const confirmedConfidence = clamp(
+    finiteNumber(savedEnsemble.confirmedConfidence, INITIAL_MODEL.ensemble?.confirmedConfidence ?? 72),
+    tacticalConfidence + 4,
+    84,
+  );
+  const convictionConfidence = clamp(
+    finiteNumber(savedEnsemble.convictionConfidence, INITIAL_MODEL.ensemble?.convictionConfidence ?? 84),
+    confirmedConfidence + 4,
+    95,
+  );
   return {
     trend: raw.trend / sum,
     rsi: raw.rsi / sum,
@@ -2403,7 +2718,28 @@ function normalizeModel(value: unknown): ModelWeights {
     squeeze: raw.squeeze / sum,
     levels: raw.levels / sum,
     pattern: raw.pattern / sum,
+    volumeProfile: raw.volumeProfile / sum,
     threshold: clamp(finiteNumber(model.threshold, INITIAL_MODEL.threshold), 0.16, 0.3),
+    ensemble: {
+      voterSpread: clamp(
+        finiteNumber(savedEnsemble.voterSpread, INITIAL_MODEL.ensemble?.voterSpread ?? 0.2),
+        0.05,
+        0.42,
+      ),
+      consensus: clamp(
+        finiteNumber(savedEnsemble.consensus, INITIAL_MODEL.ensemble?.consensus ?? 0.58),
+        0.5,
+        0.82,
+      ),
+      tacticalConfidence,
+      confirmedConfidence,
+      convictionConfidence,
+      confidenceBias: clamp(
+        finiteNumber(savedEnsemble.confidenceBias, INITIAL_MODEL.ensemble?.confidenceBias ?? 0),
+        -8,
+        8,
+      ),
+    },
   };
 }
 
@@ -2423,7 +2759,9 @@ function migrateModel(value: unknown, version: number): ModelWeights {
     squeeze: saved.squeeze * keep + INITIAL_MODEL.squeeze * (1 - keep),
     levels: saved.levels * keep + INITIAL_MODEL.levels * (1 - keep),
     pattern: saved.pattern * keep + INITIAL_MODEL.pattern * (1 - keep),
+    volumeProfile: saved.volumeProfile * keep + INITIAL_MODEL.volumeProfile * (1 - keep),
     threshold: saved.threshold * keep + INITIAL_MODEL.threshold * (1 - keep),
+    ensemble: saved.ensemble,
   });
 }
 
@@ -2478,6 +2816,9 @@ function normalizePaper(value: unknown, startingCash = PAPER_STARTING_CASH): Pap
           side: pending.side,
           setup: typeof pending.setup === "string" ? pending.setup : "Multi-signal confluence",
           confidence: clamp(finiteNumber(pending.confidence, 50), 0, 100),
+          confidenceBand: pending.confidenceBand === "TACTICAL" || pending.confidenceBand === "CONFIRMED" || pending.confidenceBand === "CONVICTION"
+            ? pending.confidenceBand
+            : "WAIT",
           stopAtr: Math.max(0.1, finiteNumber(pending.stopAtr, 0.9)),
           rewardRisk: Math.max(0.5, finiteNumber(pending.rewardRisk, 1.5)),
           maxHoldBars: Math.max(1, Math.trunc(finiteNumber(pending.maxHoldBars, 9))),
@@ -2525,7 +2866,13 @@ function normalizePersistedState(value: unknown): PersistedLabState | null {
     theme: state.theme === "light" || state.theme === "dark" ? state.theme : "light",
     model: migrateModel(state.model, savedVersion),
     trainingEpoch: Math.max(0, Math.trunc(finiteNumber(state.trainingEpoch, 1840))),
-    trainingRuns: Array.isArray(state.trainingRuns) ? state.trainingRuns.slice(0, 40) : [],
+    trainingRuns: Array.isArray(state.trainingRuns)
+      ? state.trainingRuns.slice(0, 40).map((run) => ({
+          ...run,
+          decisionQuality: finiteNumber(run.decisionQuality, 0),
+          calibrationScore: finiteNumber(run.calibrationScore, 0),
+        }))
+      : [],
     paper: normalizePaper(state.paper, preferences.paperStartingCash),
     range: range &&
       typeof range.start === "string" &&
@@ -2543,6 +2890,8 @@ export default function Home() {
   const [marketData, setMarketData] = useState(STATIC_MARKET_DATA);
   const [marketDataStatus, setMarketDataStatus] = useState<"loading" | "live" | "fallback">("loading");
   const [dataEnd, setDataEnd] = useState(DATA_END);
+  const latestMarketDateRef = useRef(DATA_END);
+  const [rangeCustomized, setRangeCustomized] = useState(false);
   const [draftStart, setDraftStart] = useState(DEFAULT_START);
   const [draftEnd, setDraftEnd] = useState(DEFAULT_END);
   const [range, setRange] = useState({ start: DEFAULT_START, end: DEFAULT_END });
@@ -2596,7 +2945,7 @@ export default function Home() {
   const result = useMemo(() => runBacktest(filteredData, model), [filteredData, model]);
   const sessionCount = useMemo(() => new Set(filteredData.map((bar) => bar.date)).size, [filteredData]);
   const trainingEvaluation = useMemo(
-    () => (TRAINING_DATA.length >= BARS_PER_SESSION * 30 ? evaluateModel(TRAINING_DATA, model) : null),
+    () => (TRAINING_DATA.length >= BARS_PER_SESSION * 30 ? evaluateModel(TRAINING_DATA, model, VALIDATION_DATA) : null),
     [model],
   );
   const latest = filteredData[filteredData.length - 1] ?? marketData[marketData.length - 1];
@@ -2630,6 +2979,15 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
+    if (marketDataStatus !== "live" || rangeCustomized || range.end > DATA_END || range.end >= dataEnd) return;
+    const timer = window.setTimeout(() => {
+      setRange((current) => current.end <= DATA_END ? { ...current, end: dataEnd } : current);
+      setDraftEnd((current) => current <= DATA_END ? dataEnd : current);
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [dataEnd, marketDataStatus, range, rangeCustomized]);
+
+  useEffect(() => {
     let cancelled = false;
     const syncMarketData = async () => {
       try {
@@ -2642,11 +3000,14 @@ export default function Home() {
         const latestDate = nextMarketData[nextMarketData.length - 1]?.date ?? DATA_END;
         const nextPaperStream = nextMarketData.filter((bar) => bar.date === latestDate);
         if (cancelled) return;
+        latestMarketDateRef.current = latestDate;
         setMarketData(nextMarketData);
         setMarketDataStatus("live");
         setDataEnd(latestDate);
-        setDraftEnd((current) => current === DEFAULT_END ? latestDate : current);
-        setRange((current) => current.end === DEFAULT_END ? { ...current, end: latestDate } : current);
+        setDraftEnd((current) => current === DEFAULT_END || current === LEGACY_DEFAULT_END ? latestDate : current);
+        setRange((current) => current.end === DEFAULT_END || current.end === LEGACY_DEFAULT_END
+          ? { ...current, end: latestDate }
+          : current);
         setPaperPrice((current) => nextPaperStream[0]?.open ?? current);
       } catch {
         if (!cancelled) setMarketDataStatus("fallback");
@@ -2735,9 +3096,13 @@ export default function Home() {
           setPreferences(saved.preferences);
           setCapitalDraft(String(saved.preferences.paperStartingCash));
           setActiveView(saved.preferences.launchView);
-          setRange(saved.range);
+          const savedRange = [DEFAULT_END, LEGACY_DEFAULT_END, DATA_END].includes(saved.range.end)
+            ? { ...saved.range, end: latestMarketDateRef.current }
+            : saved.range;
+          setRangeCustomized(![DEFAULT_END, LEGACY_DEFAULT_END, DATA_END].includes(saved.range.end));
+          setRange(savedRange);
           setDraftStart(saved.range.start);
-          setDraftEnd(saved.range.end);
+          setDraftEnd(savedRange.end);
           const savedBarIndex = paperStream.findIndex((bar) => bar.timestamp === saved.paper.lastBarTimestamp);
           const nextIndex = savedBarIndex < 0 ? 0 : Math.min(paperStream.length, savedBarIndex + 1);
           setPaperBarIndex(nextIndex);
@@ -2847,6 +3212,12 @@ export default function Home() {
   }, [toast]);
 
   useEffect(() => {
+    if (!hydrated || !preferences.autoRun || replayMode) return;
+    const timer = window.setTimeout(() => setPaperActive(marketClock.isOpen), 0);
+    return () => window.clearTimeout(timer);
+  }, [hydrated, marketClock.isOpen, preferences.autoRun, replayMode]);
+
+  useEffect(() => {
     if (!paperActive || (!marketClock.isOpen && !replayMode)) return;
     if (paperBarIndex >= paperStream.length) return;
     const delay = replayMode ? 850 : BAR_MINUTES * 60 * 1000;
@@ -2947,6 +3318,7 @@ export default function Home() {
       return;
     }
     setRangeError("");
+    setRangeCustomized(true);
     setActiveView("chart");
     setIsRunning(true);
     window.setTimeout(() => {
@@ -2960,7 +3332,7 @@ export default function Home() {
   const trainModel = useCallback(async () => {
     if (training) return;
     if (TRAINING_DATA.length < BARS_PER_SESSION * 30) {
-      setToast("The isolated 2023 training tape is unavailable");
+      setToast("The isolated 2023-2024 training tape is unavailable");
       return;
     }
 
@@ -2971,24 +3343,25 @@ export default function Home() {
     const startingEpoch = trainingEpoch;
     const { trainingData } = splitForTraining(TRAINING_DATA);
     let bestModel = { ...model };
-    const baseline = evaluateModel(TRAINING_DATA, bestModel);
+    const baseline = evaluateModel(TRAINING_DATA, bestModel, VALIDATION_DATA);
     let bestEvaluation = baseline;
     let bestObjective = baseline.objective;
 
     const teacherSeed = teacherSeedModel(trainingData, model);
-    const teacherSeedEvaluation = evaluateModel(TRAINING_DATA, teacherSeed);
+    const teacherSeedEvaluation = evaluateModel(TRAINING_DATA, teacherSeed, VALIDATION_DATA);
     if (teacherSeedEvaluation.objective > bestObjective) {
       bestModel = teacherSeed;
       bestEvaluation = teacherSeedEvaluation;
       bestObjective = teacherSeedEvaluation.objective;
     }
 
-    const maxEpochs = 30;
+    const maxEpochs = 20;
     let epochsCompleted = 0;
     for (let epoch = 1; epoch <= maxEpochs; epoch += 1) {
       epochsCompleted = epoch;
       const temperature = 0.2 * (1 - epoch / maxEpochs) + 0.018;
-      for (let candidateIndex = 0; candidateIndex < 4; candidateIndex += 1) {
+      for (let candidateIndex = 0; candidateIndex < 3; candidateIndex += 1) {
+        const currentCalibration = ensembleCalibration(bestModel);
         const raw = {
           trend: clamp(bestModel.trend + (Math.random() - 0.5) * temperature, 0.03, 0.78),
           rsi: clamp(bestModel.rsi + (Math.random() - 0.5) * temperature, 0.02, 0.52),
@@ -3001,11 +3374,20 @@ export default function Home() {
           squeeze: clamp(bestModel.squeeze + (Math.random() - 0.5) * temperature, 0.015, 0.48),
           levels: clamp(bestModel.levels + (Math.random() - 0.5) * temperature, 0.015, 0.44),
           pattern: clamp(bestModel.pattern + (Math.random() - 0.5) * temperature, 0.015, 0.44),
+          volumeProfile: clamp(bestModel.volumeProfile + (Math.random() - 0.5) * temperature, 0.02, 0.44),
           threshold: clamp(bestModel.threshold + (Math.random() - 0.5) * 0.032, 0.16, 0.3),
+          ensemble: {
+            voterSpread: clamp(currentCalibration.voterSpread + (Math.random() - 0.5) * temperature * 1.2, 0.05, 0.42),
+            consensus: clamp(currentCalibration.consensus + (Math.random() - 0.5) * 0.08, 0.5, 0.82),
+            tacticalConfidence: clamp(currentCalibration.tacticalConfidence + (Math.random() - 0.5) * 4, 54, 72),
+            confirmedConfidence: clamp(currentCalibration.confirmedConfidence + (Math.random() - 0.5) * 4, 62, 84),
+            convictionConfidence: clamp(currentCalibration.convictionConfidence + (Math.random() - 0.5) * 4, 76, 95),
+            confidenceBias: clamp(currentCalibration.confidenceBias + (Math.random() - 0.5) * 2.4, -8, 8),
+          },
         };
         const sum =
           raw.trend + raw.rsi + raw.momentum + raw.volatility + raw.vwap + raw.volume +
-          raw.orb + raw.pullback + raw.squeeze + raw.levels + raw.pattern;
+          raw.orb + raw.pullback + raw.squeeze + raw.levels + raw.pattern + raw.volumeProfile;
         const candidate: ModelWeights = {
           trend: raw.trend / sum,
           rsi: raw.rsi / sum,
@@ -3018,9 +3400,11 @@ export default function Home() {
           squeeze: raw.squeeze / sum,
           levels: raw.levels / sum,
           pattern: raw.pattern / sum,
+          volumeProfile: raw.volumeProfile / sum,
           threshold: raw.threshold,
+          ensemble: raw.ensemble,
         };
-        const candidateEvaluation = evaluateModel(TRAINING_DATA, candidate);
+        const candidateEvaluation = evaluateModel(TRAINING_DATA, candidate, VALIDATION_DATA);
         if (candidateEvaluation.objective > bestObjective) {
           bestObjective = candidateEvaluation.objective;
           bestModel = candidate;
@@ -3061,6 +3445,8 @@ export default function Home() {
         validationAlpha: bestEvaluation.validationResult.alpha,
         validationDrawdown: bestEvaluation.validationResult.maxDrawdown,
         teacherAgreement: bestEvaluation.agreement,
+        decisionQuality: bestEvaluation.decisionQuality,
+        calibrationScore: bestEvaluation.calibrationScore,
         objectiveDelta: Math.max(0, bestObjective - baseline.objective),
       },
       ...current,
@@ -3123,6 +3509,7 @@ export default function Home() {
     { label: "RSI edge", value: latestFactors.rsi, weight: model.rsi, color: "violet" },
     { label: "VWAP", value: latestFactors.vwap, weight: model.vwap, color: "blue" },
     { label: "Volume", value: latestFactors.volume, weight: model.volume, color: "mint" },
+    { label: "Volume profile", value: latestFactors.volumeProfile, weight: model.volumeProfile, color: "amber" },
     { label: "Volatility", value: latestFactors.volatility, weight: model.volatility, color: "blue" },
     { label: "Candle confirmation", value: latestFactors.pattern, weight: model.pattern, color: "violet" },
   ];
@@ -3272,7 +3659,7 @@ export default function Home() {
           <div className="mode-heading"><span className="view-kicker">CHOOSE AN ENVIRONMENT</span><h1>Where do you want to work?</h1><p>Mode is selected fresh on every visit. Your account data stays attached to your account.</p></div>
           <div className="mode-grid">
             <button className="mode-card sandbox" type="button" onClick={() => setWorkspaceMode("sandbox")}>
-              <span className="mode-card-icon"><FlaskConical size={23} /></span><small>READY</small><h2>Sandbox</h2><p>Train on isolated 2023 data, backtest 2024 onward, and replay five-minute paper trading with fake money.</p><strong>Enter sandbox <ArrowUpRight size={15} /></strong>
+              <span className="mode-card-icon"><FlaskConical size={23} /></span><small>READY</small><h2>Sandbox</h2><p>Train on isolated 2023-2024 data, backtest 2025 onward, and replay five-minute paper trading with fake money.</p><strong>Enter sandbox <ArrowUpRight size={15} /></strong>
             </button>
             <button className="mode-card live" type="button" onClick={() => setWorkspaceMode("live")}>
               <span className="mode-card-icon"><Radio size={23} /></span><small>EMPTY</small><h2>Live</h2><p>A clean broker workspace with no connection, market feed, positions, orders, or real-money controls.</p><strong>Open empty live mode <ArrowUpRight size={15} /></strong>
@@ -3386,18 +3773,18 @@ export default function Home() {
           </div>
 
           <div className={"hero-signal " + result.signal.toLowerCase()}>
-            <span className="hero-signal-icon"><BrainCircuit size={20} /></span>
+              <span className="hero-signal-icon"><BrainCircuit size={20} /></span>
             <div>
               <span>Policy action</span>
               <strong>{result.signal}</strong>
-              <small>{result.confidence}% / {latestDecision.setup}</small>
+              <small>{result.confidence}% / {latestDecision.confidenceBand} / {latestDecision.voteCount}/{latestDecision.voterCount} vote</small>
             </div>
           </div>
 
           <div className="range-builder">
             <div className="range-builder-title">
               <span><CalendarRange size={17} /></span>
-              <div><strong>Replay unseen years</strong><small>2024 onward / never used for training</small></div>
+              <div><strong>Replay unseen years</strong><small>2025 onward / held out from training</small></div>
             </div>
             <div className="range-fields">
               <label htmlFor="start-date">
@@ -3476,7 +3863,7 @@ export default function Home() {
               <div>
                 <span className="view-kicker">INTRADAY BACKTEST</span>
                 <h2>Day-trading replay</h2>
-                <p>Aggressive research cadence with regime selection, bounded risk, and no overnight positions.</p>
+            <p>Aggressive research cadence with regime selection, bounded risk, and no overnight positions.</p>
               </div>
               {backtestTab === "chart" && <div className="timeframe-control" role="group" aria-label="Chart viewport">
                 {(["ALL", "1M", "2W", "5D"] as const).map((item) => (
@@ -3603,7 +3990,7 @@ export default function Home() {
                   <div>
                     <span className="view-kicker">LEARNING LOOP</span>
                     <h2>Teacher-guided, judged out of sample</h2>
-                    <p>Only 2023 can train the policy. Its first 72% teaches; its final 28% validates. Backtests start in 2024 and never enter this loop.</p>
+    <p>Only 2023-2024 can train the policy. Candidate checkpoints are judged on the separate 2025-2026 tape before they can replace the current model.</p>
                   </div>
                   <span className={validationResult.alpha > 0 ? "training-status success" : "training-status"}>
                     {validationResult.alpha > 0 ? <Check size={14} /> : <Target size={14} />}
@@ -3654,18 +4041,22 @@ export default function Home() {
                   {trainingTab === "policy" &&
                   <article className="model-explanation">
                     <span className="view-kicker">CAUSAL POLICY</span>
-                    <h3>Four engines, one regime-aware decision</h3>
-                    <p>Trend following, momentum, mean reversion, and volume breakouts compete on every closed candle. The current regime decides how much each engine matters.</p>
+                    <h3>Seven voters, one calibrated action</h3>
+                    <p>A consensus anchor plus trend, momentum, mean reversion, volume profile, breakout, and defensive voters score every closed candle independently. Consensus controls the direction; confidence bands control whether the policy waits, trades tactically, or commits.</p>
+                    <div className="training-objective-card">
+                      <div><span>Live ensemble vote</span><strong>{latestDecision.voteSummary}</strong></div>
+                      <p>{latestDecision.confidenceBand} band / {latestDecision.confidence}% confidence / {latestDecision.action}</p>
+                    </div>
                     <div className="strategy-engine-grid">
                       {strategyEngines.map((engine) => (
                         <div className="strategy-engine" key={engine.label}>
-                          <div><span>{engine.label}</span><strong className={engine.value > 0.08 ? "positive" : engine.value < -0.08 ? "negative" : ""}>{engine.value > 0.08 ? "LONG" : engine.value < -0.08 ? "SHORT" : "NEUTRAL"}</strong></div>
+                        <div><span>{engine.label}</span><strong className={engine.value > 0.08 ? "positive" : engine.value < -0.08 ? "negative" : ""}>{engine.value > 0.08 ? "LONG" : engine.value < -0.08 ? "SHORT" : "NEUTRAL"}</strong></div>
                           <div className="engine-track"><i className={engine.value >= 0 ? "positive" : "negative"} style={{ width: `${Math.max(5, Math.abs(engine.value) * 100)}%` }} /></div>
                           <small>{engine.detail}</small>
                         </div>
                       ))}
                     </div>
-                    <h4 className="engine-factor-heading">Eleven causal indicators</h4>
+                    <h4 className="engine-factor-heading">Twelve causal indicators</h4>
                     <div className="refined-factor-list">
                       {factors.map((factor) => {
                         const contribution = factor.value * factor.weight;
@@ -3690,7 +4081,7 @@ export default function Home() {
                     <div>
                       <span className="view-kicker">HINDSIGHT TEACHER</span>
                       <h3>Shows the best direction after the fact</h3>
-                      <p>For each 2023 candle, the teacher compares the best long and short excursion over the next four five-minute candles. Those future-aware labels guide training only.</p>
+                      <p>For each 2023-2024 candle, the teacher compares the best long and short excursion over the next four five-minute candles. Those future-aware labels guide training only.</p>
                     </div>
                     <div className="teacher-score">
                       <span>Policy agreement</span>
@@ -3701,13 +4092,13 @@ export default function Home() {
                   <article className="split-card">
                     <div className="split-card-heading">
                       <div><BookOpenCheck size={17} /><span>Walk-forward split</span></div>
-                      <small>{trainingSessionCount} days / {TRAINING_DATA.length} candles / 2023 only</small>
+                      <small>{trainingSessionCount} days / {TRAINING_DATA.length} candles / 2023-2024 only</small>
                     </div>
                     <div className="split-rail" aria-label="Training and holdout split">
                       <span style={{ width: `${TRAINING_DATA.length ? trainingSplitCount / TRAINING_DATA.length * 100 : 72}%` }}>Teacher training</span>
                       <span>Unseen holdout</span>
                     </div>
-                    <p>The split is made on whole trading days with no overlapping candles. The selected 2024+ backtest range remains completely separate.</p>
+                    <p>The teacher split is made on whole trading days with no overlapping candles. Checkpoint selection also runs against the separate 2025–2026 validation tape.</p>
                   </article>
                 </div>}
 
@@ -3726,6 +4117,8 @@ export default function Home() {
                           <div><strong>{run.improved ? "Checkpoint saved" : "Checkpoint kept"}</strong><small>{new Date(run.completedAt).toLocaleString()} / {run.epochs} epochs</small></div>
                           <div><span>Holdout</span><strong className={run.validationAlpha >= 0 ? "positive" : "negative"}>{percent(run.validationAlpha)}</strong></div>
                           <div><span>Teacher</span><strong>{(run.teacherAgreement * 100).toFixed(0)}%</strong></div>
+                          <div><span>Decisions</span><strong>{percent(run.decisionQuality)}</strong></div>
+                          <div><span>Calibration</span><strong>{percent(run.calibrationScore)}</strong></div>
                         </div>
                       ))}
                     </div>
@@ -3736,6 +4129,8 @@ export default function Home() {
                   <div><Gauge size={17} /><span><small>Policy confidence</small><strong>{result.confidence}%</strong></span></div>
                   <div><ShieldCheck size={17} /><span><small>Holdout drawdown</small><strong>{percent(validationResult.maxDrawdown)}</strong></span></div>
                   <div><Target size={17} /><span><small>Teacher agreement</small><strong>{(currentTeacherAgreement * 100).toFixed(0)}%</strong></span></div>
+                  <div><BrainCircuit size={17} /><span><small>Decision quality</small><strong>{trainingEvaluation ? percent(trainingEvaluation.decisionQuality) : "--"}</strong></span></div>
+                  <div><Gauge size={17} /><span><small>Confidence calibration</small><strong>{trainingEvaluation ? percent(trainingEvaluation.calibrationScore) : "--"}</strong></span></div>
                   <button className="text-button" type="button" onClick={() => setActiveView("chart")}>View result on chart <ArrowUpRight size={14} /></button>
                 </div>}
               </>
@@ -3787,7 +4182,7 @@ export default function Home() {
                   <span className={marketClock.isOpen ? "paper-market-icon open" : "paper-market-icon"}><Clock3 size={18} /></span>
                   <div>
                     <strong>{marketClock.isOpen ? "Market session is open" : marketClock.label}</strong>
-                    <p>{paperActive ? (marketClock.isOpen ? "Four strategy engines are checking trend, momentum, mean reversion, breakouts, volume flow, and risk." : replayMode ? "A compressed demo session is replaying the same policy now." : "The bot will wake automatically at the opening bell.") : "Start the bot and it will wait safely for the next open."}</p>
+                    <p>{paperActive ? (marketClock.isOpen ? "Seven independent voters are checking trend, momentum, mean reversion, volume profile, breakouts, and risk." : replayMode ? "A compressed demo session is replaying the same policy now." : "The bot will wake automatically at the opening bell.") : "Start the bot and it will wait safely for the next open."}</p>
                   </div>
                 </div>
 
@@ -3814,7 +4209,7 @@ export default function Home() {
                 <div className="automation-rules">
                   <div><span>Decision interval</span><strong>Every five-minute candle</strong></div>
                   <div><span>Replay progress</span><strong>{Math.min(paperBarIndex, paperStream.length)} / {paperStream.length} candles</strong></div>
-                  <div><span>Position policy</span><strong>4 engines / up to {MAX_ENTRIES_PER_SESSION} entries</strong></div>
+                  <div><span>Position policy</span><strong>7 voters / up to {MAX_ENTRIES_PER_SESSION} entries</strong></div>
                   <div><span>Risk exits</span><strong>0.5% ceiling / ATR stop / 1.15–1.85R</strong></div>
                   <div><span>After a stopped trade</span><strong>One-bar reset, then resumes</strong></div>
                   <div><span>Overnight risk</span><strong>Always flat by 4:00 PM</strong></div>
@@ -4028,7 +4423,7 @@ export default function Home() {
             <div className="guide-flow" aria-label="Trading system sequence">
               <div><span>01</span><strong>Five-minute candle closes</strong><small>Only known OHLCV and indicators</small></div>
               <i />
-              <div><span>02</span><strong>Policy scores the setup</strong><small>Long, short, or no action</small></div>
+              <div><span>02</span><strong>Policy scores the setup</strong><small>Buy, sell, short, or wait</small></div>
               <i />
               <div><span>03</span><strong>Next candle executes</strong><small>Open price plus modeled costs</small></div>
               <i />
@@ -4039,8 +4434,8 @@ export default function Home() {
               <article>
                 <span className="guide-number">01</span>
                 <h3>Separate years prevent leakage</h3>
-                <p><b>Training is fixed to Jan–Dec 2023.</b> Whole trading days are split 72/28 into teacher training and unseen validation. The date picker begins in 2024, so a backtest candle cannot become a training example.</p>
-                <div className="guide-boundary"><span>2023</span><strong>Train + validate</strong><i /><span>2024–2026</span><strong>Backtest only</strong></div>
+                <p><b>Training is fixed to Jan 2023–Dec 2024.</b> New epochs calibrate seven independent voters, then are accepted only when returns, drawdown, decision quality, and confidence calibration improve on the separate 2025–2026 tape. The date picker begins in 2025, so a backtest candle cannot become a training example.</p>
+                <div className="guide-boundary"><span>2023-2024</span><strong>Train + validate</strong><i /><span>2025-2026</span><strong>Backtest only</strong></div>
               </article>
 
               <article>
@@ -4051,8 +4446,8 @@ export default function Home() {
 
               <article>
                 <span className="guide-number">03</span>
-                <h3>Four strategies, eleven causal signals</h3>
-                <p>Trend following uses EMA 9/21/50, MACD, ADX, and VWAP. Momentum combines RSI, MACD, impulse, and volume. Mean reversion reads Bollinger/VWAP stretch and rejection candles. Breakouts require ORB or key levels plus OBV-informed volume flow.</p>
+                <h3>Seven voters, thirteen causal signals</h3>
+                <p>The ensemble combines consensus, trend, momentum, mean reversion, volume profile, breakout, and defensive voters. Inputs include EMA 9/21/50, MACD, ADX, VWAP, RSI, Bollinger stretch, opening range, key levels, candle structure, volume flow, and volume-profile acceptance.</p>
               </article>
 
               <article>
@@ -4083,8 +4478,8 @@ export default function Home() {
 
               <article>
                 <span className="guide-number">07</span>
-                <h3>What “Live” means today</h3>
-                <p>Live mode is deliberately blank. It has no quote vendor, broker API, credentials, positions, or order route. Sandbox uses synthetic AAPL-like data, not historical AAPL candles, and cannot prove future profitability or place a real trade.</p>
+                <h3>Auto-run starts on the next session</h3>
+                <p>Turn on <b>Auto-run paper bot</b> in Settings and save while signed in. At the next weekday market open (9:30 ET), the browser starts the paper loop when open, and the protected server cron catches up closed five-minute candles even if the page is closed. It remains simulated: no broker, real-money route, or investment advice is involved.</p>
               </article>
             </div>
 

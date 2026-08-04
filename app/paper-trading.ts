@@ -75,13 +75,13 @@ export type ModelWeights = {
   obvThreshold: number;
 };
 
-export type TradeSide = "BUY" | "SELL";
+export type TradeSide = "BUY" | "SELL" | "SHORT" | "COVER";
 
 export type FillKind = "market" | "limit" | "stop";
 
 export type MarketRegime = "trend" | "range" | "reversal" | "squeeze";
 
-export type StrategyAlgorithm = "ema-crossover" | "macd-momentum" | "rsi-mean-reversion" | "bollinger-breakout" | "volume-surge" | "orb-breakout" | "vwap-reclaim" | "key-level-test";
+export type StrategyAlgorithm = "ema-crossover" | "macd-momentum" | "rsi-mean-reversion" | "bollinger-breakout" | "volume-surge" | "orb-breakout" | "vwap-reclaim" | "key-level-test" | "ensemble";
 
 export type PaperAccount = {
   cash: number;
@@ -215,7 +215,7 @@ function executionFill(
 }
 
 // PAPER_STREAM - simplified for server-side (in production, fetch from KV or compute)
-let PAPER_STREAM_CACHE: MarketBar[] | null = null;
+const PAPER_STREAM_CACHE: MarketBar[] | null = null;
 
 export function getPaperStream(): MarketBar[] {
   if (PAPER_STREAM_CACHE) return PAPER_STREAM_CACHE;

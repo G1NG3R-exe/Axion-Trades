@@ -1,6 +1,6 @@
 # Axion Trades
 
-Axion Trades is a trading-research sandbox for exploring a simulated, AAPL-like instrument. It provides backtesting, a five-minute paper-trading replay, account-backed workspaces, and model configuration in a single application.
+Axion Trades is a trading-research sandbox for exploring a simulated, AAPL-like instrument. It provides backtesting, live five-minute paper-trading data, account-backed workspaces, and model configuration in a single application.
 
 > **Simulation only.** This project does not connect to a broker, place orders, or provide investment advice. Market data and execution are simulated; results are not evidence that a strategy will be profitable.
 
@@ -9,6 +9,7 @@ Axion Trades is a trading-research sandbox for exploring a simulated, AAPL-like 
 - A React, TypeScript, Next.js/Vinext application built with Vite.
 - Research and evaluation flows that keep training data separate from selected out-of-sample backtests.
 - Paper-trading accounts with simulated positions, fills, fees, slippage, risk controls, and end-of-session liquidation.
+- Optional auto-run paper trading that starts at the next weekday market open and catches up server-side every five minutes.
 - Username/password authentication, persisted account state, and Cloudflare D1 storage via Drizzle.
 - A Cloudflare Worker entry point, including a scheduled paper-trading handler.
 
@@ -88,7 +89,13 @@ Do not commit or share `.env.local`, `cookies.txt`, tokens, passwords, API keys,
 This repository contains Cloudflare and Vercel configuration. Choose one target deliberately before deploying:
 
 - **Cloudflare:** requires Wrangler account access, a D1 database binding named `DB`, migrations from `drizzle/`, and the `AUTH_PEPPER` secret.
-- **Vercel:** requires Vercel access and any applicable environment variables listed above.
+- **Vercel:** requires Vercel access and any applicable environment variables listed above. The D1-backed auto-trading schedule runs on the Cloudflare Worker; Vercel serves the frontend and keeps a protected cron endpoint available for a future plan that supports subdaily cron jobs.
+
+### Automatic paper trading
+
+Sign in, open Settings, and enable **Auto-run paper bot**. The setting is saved to the account. On the next weekday at 9:30 ET, the browser starts the local paper loop if it is open, while the scheduled backend processes closed five-minute candles even when the browser is closed. The worker only processes regular-session bars, uses the current live AAPL feed, and keeps the simulation flat at the close.
+
+If the frontend is deployed to Vercel, the account bridge uses the Worker URL by default. The protected cron endpoint rejects requests without `CRON_SECRET`; the production Worker schedule is the component that performs the five-minute server-side runs.
 
 Before deploying, decide whether to reuse the existing D1 database or provision a new one. Never replace a database or run migrations against production unintentionally.
 
