@@ -25,6 +25,29 @@ export const dynamic = "force-dynamic";
 
 const ALLOWED_RANGES = new Set(["5d", "60d"]);
 
+function parseDailyBars(payload: YahooChartResponse) {
+  const result = payload.chart?.result?.[0];
+  const quote = result?.indicators?.quote?.[0];
+  const timestamps = result?.timestamp ?? [];
+  return timestamps.flatMap((timestamp, index) => {
+    const dateParts = new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/New_York",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).formatToParts(new Date(timestamp * 1000));
+    const part = (parts: Intl.DateTimeFormatPart[], type: string) => parts.find((item) => item.type === type)?.value ?? "";
+    const sessionDate = `${part(dateParts, "year")}-${part(dateParts, "month")}-${part(dateParts, "day")}`;
+    const open = numberAt(quote?.open, index);
+    const high = numberAt(quote?.high, index);
+    const low = numberAt(quote?.low, index);
+    const close = numberAt(quote?.close, index);
+    const volume = numberAt(quote?.volume, index);
+    if (open === null || high === null || low === null || close === null || volume === null) return [];
+    return [{ date: sessionDate, open, high, low, close, volume: Math.max(0, Math.round(volume)) }];
+  });
+}
+
 export async function GET(request: Request) {
   const symbol = new URL(request.url).searchParams.get("symbol")?.toUpperCase() || "AAPL";
   const requestedRange = new URL(request.url).searchParams.get("range") || "5d";
@@ -40,11 +63,25 @@ export async function GET(request: Request) {
     includePrePost: "false",
     events: "div,splits",
   }).toString();
+  const dailyUrl = new URL(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}`);
+  dailyUrl.search = new URLSearchParams({
+    interval: "1d",
+    range: "2y",
+    includePrePost: "false",
+    events: "div,splits",
+  }).toString();
 
   try {
-    const upstream = await fetch(upstreamUrl, {
-      headers: { accept: "application/json", "user-agent": "AxionTrades/1.0" },
-    });
+    const [upstream, dailyUpstream] = await Promise.all([
+      fetch(upstreamUrl, {
+        headers: { accept: "application/json", "user-agent": "AxionTrades/1.0" },
+      }),
+      range === "60d"
+        ? fetch(dailyUrl, {
+            headers: { accept: "application/json", "user-agent": "AxionTrades/1.0" },
+          })
+        : Promise.resolve(null),
+    ]);
     if (!upstream.ok) {
       return Response.json({ error: `Market data provider returned ${upstream.status}` }, { status: 502 });
     }
@@ -96,8 +133,18 @@ export async function GET(request: Request) {
     });
 
     if (!bars.length) return Response.json({ error: "Market data provider returned no regular-session bars" }, { status: 502 });
+    const dailyBars = dailyUpstream?.ok
+      ? parseDailyBars(await dailyUpstream.json() as YahooChartResponse)
+      : [];
     return Response.json(
-      { symbol, source: "Yahoo Finance", fetchedAt: new Date().toISOString(), bars },
+      {
+        symbol,
+        source: "Yahoo Finance",
+        fetchedAt: new Date().toISOString(),
+        bars,
+        dailyBars,
+        dailyContextRange: dailyBars.length ? "2y" : null,
+      },
       { headers: { "cache-control": "no-store" } },
     );
   } catch (error) {

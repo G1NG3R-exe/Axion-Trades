@@ -99,12 +99,26 @@ type MarketBar = {
   volumeProfileValueHigh: number;
   volumeProfileValueLow: number;
   volumeProfileBias: number;
+  dailyTrend: number;
+  dailyVolatility: number;
+  dailyBreakout: number;
 };
 
 type RawMarketBar = Pick<
   MarketBar,
   "date" | "time" | "timestamp" | "barInSession" | "open" | "high" | "low" | "close" | "volume"
 >;
+
+type RawDailyBar = {
+  date: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+};
+
+type DailyContext = Pick<MarketBar, "dailyTrend" | "dailyVolatility" | "dailyBreakout">;
 
 type ModelWeights = {
   trend: number;
@@ -487,6 +501,9 @@ function generateMarketData(): MarketBar[] {
     | "volumeProfileValueHigh"
     | "volumeProfileValueLow"
     | "volumeProfileBias"
+    | "dailyTrend"
+    | "dailyVolatility"
+    | "dailyBreakout"
   >[] = [];
   const cursor = new Date(`${DATA_START}T12:00:00Z`);
   const lastDate = new Date(`${DATA_END}T12:00:00Z`);
@@ -591,8 +608,49 @@ function generateMarketData(): MarketBar[] {
   return enrichMarketData(raw);
 }
 
-function enrichMarketData(raw: RawMarketBar[]): MarketBar[] {
+function buildDailyContext(dailyBars: RawDailyBar[]): Map<string, DailyContext> {
+  const contexts = new Map<string, DailyContext>();
+  if (dailyBars.length < 2) return contexts;
+  let ema20 = dailyBars[0].close;
+  let ema50 = dailyBars[0].close;
+  let previousClose = dailyBars[0].close;
+  const returns: number[] = [];
+  let previousContext: DailyContext = { dailyTrend: 0, dailyVolatility: 0, dailyBreakout: 0 };
+
+  for (let index = 0; index < dailyBars.length; index += 1) {
+    const bar = dailyBars[index];
+    const dailyReturn = index === 0 ? 0 : bar.close / previousClose - 1;
+    returns.push(dailyReturn);
+    const returnWindow = returns.slice(Math.max(0, returns.length - 20));
+    const returnMean = returnWindow.reduce((sum, value) => sum + value, 0) / Math.max(1, returnWindow.length);
+    const dailyVolatility = clamp(
+      Math.sqrt(returnWindow.reduce((sum, value) => sum + (value - returnMean) ** 2, 0) / Math.max(1, returnWindow.length)) / 0.018,
+      0,
+      2,
+    );
+    const priorHigh = index >= 20 ? Math.max(...dailyBars.slice(index - 20, index).map((value) => value.high)) : bar.high;
+    const priorLow = index >= 20 ? Math.min(...dailyBars.slice(index - 20, index).map((value) => value.low)) : bar.low;
+    const dailyBreakout = bar.close > priorHigh
+      ? clamp((bar.close - priorHigh) / Math.max(bar.close * 0.01, bar.high - bar.low), 0, 1)
+      : bar.close < priorLow
+        ? -clamp((priorLow - bar.close) / Math.max(bar.close * 0.01, bar.high - bar.low), 0, 1)
+        : 0;
+    contexts.set(bar.date, previousContext);
+    ema20 = bar.close * (2 / 21) + ema20 * (19 / 21);
+    ema50 = bar.close * (2 / 51) + ema50 * (49 / 51);
+    previousContext = {
+      dailyTrend: clamp((ema20 - ema50) / Math.max(bar.close * 0.018, 0.01), -1, 1),
+      dailyVolatility,
+      dailyBreakout,
+    };
+    previousClose = bar.close;
+  }
+  return contexts;
+}
+
+function enrichMarketData(raw: RawMarketBar[], dailyBars: RawDailyBar[] = []): MarketBar[] {
   if (!raw.length) return [];
+  const dailyContext = buildDailyContext(dailyBars);
   const closes = raw.map((bar) => bar.close);
   const returns = closes.map((close, index) => index === 0 ? 0 : close / closes[index - 1] - 1);
   let fast = closes[0];
@@ -809,6 +867,9 @@ function enrichMarketData(raw: RawMarketBar[]): MarketBar[] {
       volumeProfileValueHigh,
       volumeProfileValueLow,
       volumeProfileBias,
+      dailyTrend: dailyContext.get(bar.date)?.dailyTrend ?? 0,
+      dailyVolatility: dailyContext.get(bar.date)?.dailyVolatility ?? 0,
+      dailyBreakout: dailyContext.get(bar.date)?.dailyBreakout ?? 0,
     };
   });
 }
@@ -847,8 +908,11 @@ const STATIC_MARKET_DATA = typeof window === "undefined"
   ? generateBootstrapMarketData()
   : generateBootstrapMarketData();
 
-function mergeLiveMarketData(liveBars: RawMarketBar[]): MarketBar[] {
-  return enrichMarketData([...liveBars].sort((a, b) => a.timestamp.localeCompare(b.timestamp)));
+function mergeLiveMarketData(liveBars: RawMarketBar[], dailyBars: RawDailyBar[] = []): MarketBar[] {
+  return enrichMarketData(
+    [...liveBars].sort((a, b) => a.timestamp.localeCompare(b.timestamp)),
+    dailyBars,
+  );
 }
 
 function scoreBarCore(bar: MarketBar, weights: ModelWeights, explain = true) {
@@ -857,7 +921,7 @@ function scoreBarCore(bar: MarketBar, weights: ModelWeights, explain = true) {
   const structuralDirection = clamp((bar.ema21 - bar.ema50) / (atrUnit * 1.45), -1, 1);
   const macdDirection = clamp((bar.macd - bar.macdSignal) / (atrUnit * 0.34), -1, 1);
   const trend = clamp(
-    emaDirection * 0.38 + structuralDirection * 0.24 + bar.directionalIndex * 0.22 + macdDirection * 0.16,
+    emaDirection * 0.34 + structuralDirection * 0.21 + bar.directionalIndex * 0.19 + macdDirection * 0.14 + bar.dailyTrend * 0.12,
     -1,
     1,
   );
@@ -876,7 +940,7 @@ function scoreBarCore(bar: MarketBar, weights: ModelWeights, explain = true) {
     1,
   );
   const volatility = clamp(
-    Math.sign(bar.bodyStrength || momentum) * (bar.rangeExpansion - 0.85) * 0.62,
+    Math.sign(bar.bodyStrength || momentum || bar.dailyTrend) * (bar.rangeExpansion - 0.85) * 0.55 + bar.dailyBreakout * 0.22,
     -1,
     1,
   );
@@ -958,7 +1022,7 @@ function scoreBarCore(bar: MarketBar, weights: ModelWeights, explain = true) {
     1,
   );
   const breakout = clamp(
-    orb * 0.32 + levelBreakout * 0.24 + squeeze * 0.18 + volume * 0.16 + volumeProfile * 0.1,
+    orb * 0.28 + levelBreakout * 0.22 + squeeze * 0.16 + volume * 0.14 + volumeProfile * 0.08 + bar.dailyBreakout * 0.12,
     -1,
     1,
   );
@@ -1263,6 +1327,11 @@ function pendingEntryForBar(
       ? "SHORT"
       : null;
   if (!side) return null;
+  const dailyTrend = bar.dailyTrend;
+  if (
+    scored.regime !== "SQUEEZE" &&
+    ((side === "LONG" && dailyTrend < -0.48) || (side === "SHORT" && dailyTrend > 0.48))
+  ) return null;
   return {
     side,
     setup: scored.setup,
@@ -1940,26 +2009,26 @@ function evaluateModel(data: MarketBar[], weights: ModelWeights, externalValidat
   const agreement = teacherAgreement(trainingData, weights);
   const validationAgreement = teacherAgreement(evaluationData, weights);
   const validationMetrics = ensembleDecisionMetrics(evaluationData, weights);
-  const turnoverPenalty = Math.max(0, validationResult.tradesPerDay - 22);
-  const undertradingPenalty = Math.max(0, 10 - validationResult.tradesPerDay);
-  const cadenceReward = Math.min(18, validationResult.tradesPerDay) * 0.0022;
+  const turnoverPenalty = Math.max(0, validationResult.tradesPerDay - 14) * 0.018;
+  const undertradingPenalty = Math.max(0, 5 - validationResult.tradesPerDay) * 0.008;
+  const consistencyPenalty = Math.max(0, 0.55 - validationResult.positiveWeekRate) * 0.12;
   const objective =
-    validationResult.strategyReturn * 0.72 +
-    validationResult.alpha * 0.58 +
-    validationResult.averageWeekReturn * 1.25 +
-    validationResult.positiveWeekRate * 0.025 +
-    validationResult.sharpe * 0.012 -
-    Math.abs(validationResult.maxDrawdown) * 0.38 +
-    trainingResult.strategyReturn * 0.1 +
+    validationResult.strategyReturn * 0.52 +
+    validationResult.alpha * 0.9 +
+    validationResult.averageWeekReturn * 1.45 +
+    validationResult.positiveWeekRate * 0.08 +
+    validationResult.sharpe * 0.02 -
+    Math.abs(validationResult.maxDrawdown) * 0.72 +
+    trainingResult.strategyReturn * 0.06 +
     agreement * 0.08 +
     validationAgreement * 0.12 +
     validationMetrics.decisionQuality * 0.12 +
     validationMetrics.calibrationScore * 0.08 +
     Math.max(0, 0.5 - validationMetrics.decisionQuality) * -0.8 +
     Math.max(0, 0.6 - validationMetrics.calibrationScore) * -0.7 +
-    turnoverPenalty * 0.012 -
-    undertradingPenalty * 0.012 +
-    cadenceReward;
+    -turnoverPenalty -
+    undertradingPenalty -
+    consistencyPenalty;
 
   return {
     objective,
@@ -2999,11 +3068,11 @@ export default function Home() {
     const syncMarketData = async () => {
       try {
         const response = await fetch("/api/market-data?symbol=AAPL&range=60d", { cache: "no-store" });
-        const body = await response.json() as { bars?: RawMarketBar[]; error?: string };
+        const body = await response.json() as { bars?: RawMarketBar[]; dailyBars?: RawDailyBar[]; error?: string };
         if (!response.ok || !Array.isArray(body.bars) || !body.bars.length) {
           throw new Error(body.error || "Live market data unavailable");
         }
-        const nextMarketData = mergeLiveMarketData(body.bars);
+        const nextMarketData = mergeLiveMarketData(body.bars, body.dailyBars ?? []);
         const latestDate = nextMarketData[nextMarketData.length - 1]?.date ?? DATA_END;
         const nextPaperStream = nextMarketData.filter((bar) => bar.date === latestDate);
         if (cancelled) return;
@@ -4117,13 +4186,13 @@ export default function Home() {
                   <article className="split-card">
                     <div className="split-card-heading">
                       <div><BookOpenCheck size={17} /><span>Walk-forward split</span></div>
-                      <small>{trainingSessionCount} days / {trainingData.length} candles / actual AAPL 5-minute history</small>
+                      <small>{trainingSessionCount} days / {trainingData.length} candles / actual AAPL tape + 2-year daily context</small>
                     </div>
                     <div className="split-rail" aria-label="Training and holdout split">
                       <span style={{ width: `${trainingData.length ? trainingSplitCount / trainingData.length * 100 : 72}%` }}>Teacher training</span>
                       <span>Unseen holdout</span>
                     </div>
-                    <p>The provider currently exposes a rolling 60-day 5-minute window. The split is made on whole actual trading days with no overlapping candles, and checkpoint selection runs on the later holdout days.</p>
+                    <p>The provider exposes a rolling 60-day 5-minute window plus a 2-year actual AAPL daily context feed that includes 2025. The split is made on whole trading days with no overlapping candles, and checkpoint selection runs on the later holdout days.</p>
                   </article>
                 </div>}
 
@@ -4459,7 +4528,7 @@ export default function Home() {
               <article>
                 <span className="guide-number">01</span>
                 <h3>Actual data, clean holdout</h3>
-                <p className="actual-training-copy"><b>Training uses actual AAPL data.</b> The browser requests the provider&apos;s rolling 60-day 5-minute history, enriches it with causal indicators, then splits whole trading days into teacher-training and unseen holdout windows. No generated price tape is used after the live history loads.</p>
+                <p className="actual-training-copy"><b>Training uses actual AAPL data.</b> The browser requests the provider&apos;s rolling 60-day 5-minute history and a 2-year daily history that includes all of 2025. It adds only causal regime context from completed prior daily bars, then splits whole trading days into teacher-training and unseen holdout windows. No generated price tape is used after the live history loads.</p>
                 <div className="guide-boundary"><span>Actual AAPL</span><strong>Teacher train</strong><i /><span>Actual AAPL</span><strong>Holdout</strong></div>
               </article>
 
